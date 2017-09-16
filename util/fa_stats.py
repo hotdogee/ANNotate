@@ -66,17 +66,19 @@ def fa_stats(fa_file, bin_size=10):
         else:
             seq += line
     process_seq() # last seq
+    print_progress_bar(file_size, file_size, prefix='Progress:', suffix='Complete', length=50)
     fa_f.close()
 
     # output
     print('{}\t{}'.format('Bin', 'Count'))
     for i, c in enumerate(hist_list):
         print('{}\t{}'.format(i * bin_size, c))
+    len_list.sort()
     print('{:>20}{:>15}'.format('Sequence Count:', len(len_list)))
-    print('{:>20}{:>15}'.format('Min Length:', min(len_list)))
+    print('{:>20}{:>15}'.format('Min Length:', len_list[0]))
     print('{:>20}{:>15}'.format('Median Length:', len_list[int(len(len_list)/2)]))
     print('{:>20}{:>15}'.format('Average Length:', int(sum(len_list)/len(len_list))))
-    print('{:>20}{:>15}'.format('Max Length:', max(len_list)))
+    print('{:>20}{:>15}'.format('Max Length:', len_list[-1]))
 
 
 if __name__ == '__main__':
