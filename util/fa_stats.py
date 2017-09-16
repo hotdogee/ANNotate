@@ -97,7 +97,7 @@ if __name__ == '__main__':
 # uniprot.gz
 #      Sequence Count:       71201428
 #          Min Length:              2
-#       Median Length:            306
+#       Median Length:            267
 #      Average Length:            335
 #          Max Length:          36805
 # Bin     Count
