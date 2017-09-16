@@ -35,11 +35,11 @@ def _gzip_size(filename):
         return struct.unpack('I', f.read(4))[0]
 
 
-def _pfam_fa_to_domain_dict(fa_path):
-    """Parse a Pfam-A.fasta.gz file into domain_dict[domain] = [(seq_id, sequence), ...]
+def _fa_gz_to_dict(fa_path):
+    """Parse a FASTA.gz file into fa_dict[seq_id] = sequence
     """
-    domain_dict = defaultdict(list)
-    seq_id, domain, sequence = '', '', ''
+    fa_dict = {}
+    seq_id, sequence = '', ''
     target = _gzip_size(fa_path)
     while target < os.path.getsize(fa_path):
         # the uncompressed size can't be smaller than the compressed size, so add 4GB
@@ -57,15 +57,50 @@ def _pfam_fa_to_domain_dict(fa_path):
             line = line.strip().decode('utf-8')
             if len(line) > 0 and line[0] == '>':
                 if sequence:
-                    domain_dict[domain].append((seq_id, sequence))
-                    seq_id, domain, sequence = '', '', ''
+                    fa_dict[seq_id] = sequence
+                    seq_id, sequence = '', ''
                 # parse header
                 seq_id = line.split()[0]
-                domain = line.split()[2]
             else:
                 sequence += line
+        if sequence:
+            fa_dict[seq_id] = sequence
         prog.update(fa_f.tell(), force=True)
-    return domain_dict
+    return fa_dict
+
+
+def _pfam_regions_tsv_to_dict(fa_path):
+    """Parse a Pfam-A.regions.uniprot.tsv.gz file into regions_dict[seq_id] = [(), ...]
+    """
+    fa_dict = {}
+    seq_id, sequence = '', ''
+    target = _gzip_size(fa_path)
+    while target < os.path.getsize(fa_path):
+        # the uncompressed size can't be smaller than the compressed size, so add 4GB
+        target += 2**32
+    prog = Progbar(target)
+    current = 0
+    with gzip.open(fa_path, 'r') as fa_f:
+        for line in fa_f:
+            # if (int(fa_f.tell()/target*100) > current):
+            #     current = int(fa_f.tell()/target*100)
+            #     print('{}/{} ({:.2f}%)'.format(fa_f.tell(), target, current))
+            if target < fa_f.tell():
+                target += 2**32
+            prog.update(fa_f.tell())
+            line = line.strip().decode('utf-8')
+            if len(line) > 0 and line[0] == '>':
+                if sequence:
+                    fa_dict[seq_id] = sequence
+                    seq_id, sequence = '', ''
+                # parse header
+                seq_id = line.split()[0]
+            else:
+                sequence += line
+        if sequence:
+            fa_dict[seq_id] = sequence
+        prog.update(fa_f.tell(), force=True)
+    return fa_dict
 
 aa_list = 'FLIMVPAWGSTYQNCO*UHKRDEBZX-'
 

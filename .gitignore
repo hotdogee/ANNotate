@@ -87,3 +87,10 @@ ENV/
 
 # Rope project settings
 .ropeproject
+
+# training reports
+classification_report/
+tfevents/
+confusion_matrix/
+csvlogs/
+modelplots/
