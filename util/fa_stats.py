@@ -82,8 +82,6 @@ def fa_stats(fa_file, bin_size=10):
 
 
 if __name__ == '__main__':
-    import os
-    import sys
     import argparse
     parser = argparse.ArgumentParser(description='Prints fasta file stats.')
     parser.add_argument('-b', '--binsize', type=int, default=10,
