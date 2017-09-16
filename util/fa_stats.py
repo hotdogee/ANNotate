@@ -8,7 +8,7 @@
 import os
 import sys
 
-def printProgressBar(iteration, total, prefix = '', suffix = '', decimals = 1, length = 100, fill = '█'):
+def print_progress_bar(iteration, total, prefix='', suffix='', decimals=1, length=100, fill='█'):
     """
     Call in a loop to create terminal progress bar
     @params:
@@ -54,9 +54,9 @@ def fa_stats(fa_file, bin_size=10):
                 hist_list += [0] * (seq_bin + 1 - len(hist_list))
             hist_list[seq_bin] += 1
             if len(len_list) % 100000 == 0:
-                printProgressBar(bytes_read, file_size, prefix='Progress:', suffix='Complete', length=50)
+                print_progress_bar(bytes_read, file_size, prefix='Progress:', suffix='Complete', length=50)
     
-    printProgressBar(bytes_read, file_size, prefix='Progress:', suffix='Complete', length=50)
+    print_progress_bar(bytes_read, file_size, prefix='Progress:', suffix='Complete', length=50)
     for line in fa_f:
         bytes_read += len(line)
         line = line.strip()
