@@ -66,7 +66,7 @@ def pfam_regions_tsv_stats(tsv_file, bin_size=10):
     tsv_f.close()
 
     # output
-    print('{}\t{}'.format('Bin', 'Count'))
+    print('{}\t{}'.format('Region length', 'Count'))
     for i, c in enumerate(hist_list):
         print('{}\t{}'.format(i * bin_size, c))
     print('{:>20}{:>15}'.format('Region Count:', len(len_list)))
@@ -122,7 +122,7 @@ if __name__ == '__main__':
 #              Median:            863
 #             Average:           5311
 #                 Max:        1078482
-# Bin     Count
+# Region length     Count
 # 0       10736
 # 10      507548
 # 20      1862256

@@ -36,6 +36,7 @@ def fa_stats(fa_file, bin_size=10):
     fa_f = open(fa_file, 'r')
     file_size = os.path.getsize(fa_file)
 
+    header = ''
     seq = ''
     len_list = []
     hist_list = []
@@ -47,6 +48,7 @@ def fa_stats(fa_file, bin_size=10):
         nonlocal hist_list
         if seq: # closure seq
             seq_len = len(seq)
+            if seq_len > 36800: print(header)
             seq_bin = int(seq_len / bin_size)
             len_list.append(seq_len)
             # extend hist_list if needed
@@ -62,6 +64,7 @@ def fa_stats(fa_file, bin_size=10):
         line = line.strip()
         if len(line) > 0 and line[0] == '>':
             process_seq()
+            header = line
             seq = ''
         else:
             seq += line
