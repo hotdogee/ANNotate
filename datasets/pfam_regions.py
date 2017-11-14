@@ -489,15 +489,19 @@ def sparse_train(model, model_name, file_name, num_domain, epoch_start=0, save_f
                 enqueuer.start(workers=1, max_queue_size=10)
                 output_generator = enqueuer.get()
                 progbar = Progbar(target=steps)
-                y_test_class = []
-                y_pred_class = []
-                with open(y_pred_text_path, 'w') as f:
-                    while steps_done < steps:
-                        x, y = next(output_generator)
-                        y_pred = model.predict_on_batch(x)
-                        # y_pred.shape = (32, ?, 13)
-                        y_c = y.reshape(y.shape[0], y.shape[1])
-                        y_pred_c = [np.argmax(s, axis=1) for s in y_pred]
+                y_test_class_list = []
+                y_pred_class_list = []
+                write_text = False
+                if not os.path.exists(y_pred_text_path):
+                    write_text = True
+                    f = open(y_pred_text_path, 'w')
+                while steps_done < steps:
+                    x, y = next(output_generator)
+                    y_pred = model.predict_on_batch(x)
+                    # y_pred.shape = (32, ?, 13)
+                    y_c = y.reshape(y.shape[0], y.shape[1])
+                    y_pred_c = [np.argmax(s, axis=1) for s in y_pred]
+                    if write_text:
                         for i in range(len(x)):
                             # sequence
                             f.write('>{}\n'.format(''.join([aa_list[a-1] for a in x[i] if a != 0])))
@@ -505,18 +509,21 @@ def sparse_train(model, model_name, file_name, num_domain, epoch_start=0, save_f
                             f.write('@{}\n'.format(''.join(['{:X}'.format(d) for d in y_c[i] if d != 0])))
                             # predicted
                             f.write('${}\n'.format(''.join(['{:X}'.format(d) for d in y_pred_c[i] if d != 0])))
-                        y_test_class.append(np.concatenate(y_c))
-                        y_pred_class.append(np.concatenate(y_pred_c))
-                        steps_done += 1
-                        progbar.update(steps_done)
+                    y_test_class_list.append(np.concatenate(y_c))
+                    y_pred_class_list.append(np.concatenate(y_pred_c))
+                    steps_done += 1
+                    progbar.update(steps_done)
+                if write_text:
+                    f.close()
+                
                 # y_pred = model.predict_generator(test_gen, steps=test_steps, verbose=1)
                 # y_pred = [b.tolist() for b in y_pred]
                 # with open(y_pred_path, 'w') as f:
                 #     json.dump(y_pred, f)
                 # y_pred = np.array(y_pred)
-                print('y_pred_class shape:', y_pred_class.shape) # (297679, 10)
-                y_test_class = np.concatenate(y_test_class)
-                y_pred_class = np.concatenate(y_pred_class)
+                print('y_pred_class_list len:', len(y_pred_class_list)) # (297679, 10)
+                y_test_class = np.concatenate(y_test_class_list)
+                y_pred_class = np.concatenate(y_pred_class_list)
                 print('y_pred_class shape:', y_pred_class.shape) # (297679, 10)
                 np.savez_compressed(y_pred_path, y_test_class=y_test_class, y_pred_class=y_pred_class)
             # y_pred_class = np.argmax(y_pred, axis=1)

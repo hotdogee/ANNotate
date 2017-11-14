@@ -51,7 +51,8 @@ model.add(TimeDistributed(Dense(3 + num_domain, activation='softmax')))
 model.summary()
 epoch_start = 0
 pfam_regions.sparse_train(model, model_name, __file__, num_domain, device='/gpu:0', 
-    epoch_start=epoch_start, batch_size=batch_size, epochs=epochs)
+    epoch_start=epoch_start, batch_size=batch_size, epochs=epochs,
+    predicted_dir='C:/Users/Hotdogee/Documents/Annotate/predicted')
 
 # Pfam-A.regions.uniprot.tsv.gz
 #        Region Count:       88761542
