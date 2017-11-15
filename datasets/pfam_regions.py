@@ -455,6 +455,7 @@ def sparse_train(model, model_name, file_name, num_domain, epoch_start=0, save_f
             if os.path.exists(model_path):
                 print('Loading model:', os.path.basename(model_path))
                 model = load_model(model_path)
+                continue
             else:
                 history = model.fit_generator(train_gen,
                     steps_per_epoch=train_steps,
