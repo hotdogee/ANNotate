@@ -12,7 +12,7 @@ from keras.layers import CuDNNGRU, CuDNNLSTM
 num_domain = 10
 test_split = 0.2
 validation_split = 0.1
-batch_size = 32
+batch_size = 64
 epochs = 300
 
 embedding_dims = 32
