@@ -17,15 +17,16 @@ epochs = 300
 
 embedding_dims = 32
 embedding_dropout = 0.2
+lstm_output_size = 32
 filters = 32
 kernel_size = 7
-lstm_output_size = 32
+conv_dropout = 0.2
 dense_size = 32
 dense_dropout = 0.2
 
-model_name = 'ed{0}eo{1:.0f}cf{2}ks{3}ls{4}ds{5}do{6:.0f}'.format(
-    embedding_dims, embedding_dropout * 100, filters, kernel_size, 
-    lstm_output_size, dense_size, dense_dropout * 100)
+model_name = 'ed{0}eo{1:.0f}ls{2}ds{3}dd{4:.0f}'.format(
+    embedding_dims, embedding_dropout * 100, lstm_output_size, dense_size, 
+    dense_dropout * 100)
 
 print('Building model...')
 model = Sequential()
@@ -34,19 +35,20 @@ model.add(Embedding(len(pfam_regions.aa_list) + 1,
                     embedding_dims,
                     input_length=None))
 model.add(Dropout(embedding_dropout))
+# model.add(Conv1D(filters,
+#                 kernel_size,
+#                 padding='same',
+#                 activation='relu',
+#                 strides=1))
+# model.add(TimeDistributed(Dropout(conv_dropout)))
 # Expected input batch shape: (batch_size, timesteps, data_dim)
 # returns a sequence of vectors of dimension lstm_output_size
 model.add(Bidirectional(CuDNNGRU(lstm_output_size, return_sequences=True)))
 # model.add(Bidirectional(LSTM(lstm_output_size, dropout=0.0, recurrent_dropout=0.0, return_sequences=True)))
-# model.add(TimeDistributed(Conv1D(filters,
-#                 kernel_size,
-#                 padding='valid',
-#                 activation='relu',
-#                 strides=1)))
-# model.add(GlobalMaxPooling1D())
-# model.add(TimeDistributed(Dense(dense_size)))
-# model.add(TimeDistributed(Activation('relu')))
-# model.add(TimeDistributed(Dropout(dense_dropout)))
+
+model.add(TimeDistributed(Dense(dense_size)))
+model.add(TimeDistributed(Activation('relu')))
+model.add(TimeDistributed(Dropout(dense_dropout)))
 model.add(TimeDistributed(Dense(3 + num_domain, activation='softmax')))
 model.summary()
 epoch_start = 0
@@ -63,29 +65,37 @@ pfam_regions.sparse_train(model, model_name, __file__, num_domain, device='/gpu:
 # _________________________________________________________________
 # bidirectional_1 (Bidirection (None, None, 64)          12672
 # _________________________________________________________________
-# time_distributed_1 (TimeDist (None, None, 13)          845
+# time_distributed_1 (TimeDist (None, None, 32)          2080
+# _________________________________________________________________
+# time_distributed_2 (TimeDist (None, None, 32)          0
+# _________________________________________________________________
+# time_distributed_3 (TimeDist (None, None, 32)          0
+# _________________________________________________________________
+# time_distributed_4 (TimeDist (None, None, 13)          429
 # =================================================================
-# Total params: 14,413
-# Trainable params: 14,413
+# Total params: 16,077
+# Trainable params: 16,077
 # Non-trainable params: 0
 # _________________________________________________________________
 
 #                 precision    recall  f1-score   support
 
-#            PAD    1.00000   1.00000   1.00000 862187725
-#      NO_DOMAIN    0.96240   0.96527   0.96383 157729784
-# UNKNOWN_DOMAIN    0.99311   0.98970   0.99140  31941877
-#        PF00005    0.99765   0.99818   0.99792  38678560
-#        PF00115    0.94330   0.94382   0.94356  35287282
-#        PF07690    0.76129   0.78206   0.77153   4328264
-#        PF00400    0.74828   0.76825   0.75813   2389194
-#        PF00096    0.97725   0.95595   0.96648  11183619
-#        PF00072    0.95968   0.97149   0.96555  19053029
-#        PF00528    0.76038   0.60600   0.67446   1474548
-#        PF00106    0.95933   0.94758   0.95342  18041648
-#        PF13561    0.97345   0.96788   0.97066   9156086
+#            PAD    1.00000   1.00000   1.00000 862358460
+#      NO_DOMAIN    0.96755   0.96380   0.96567 157730093
+# UNKNOWN_DOMAIN    0.99081   0.99494   0.99287  31941925
+#        PF00005    0.99861   0.99797   0.99829  38679125
+#        PF00115    0.92991   0.96485   0.94706  35285414
+#        PF07690    0.80492   0.70804   0.75338   4328191
+#        PF00400    0.72832   0.80425   0.76440   2389194
+#        PF00096    0.98424   0.96635   0.97521  11183701
+#        PF00072    0.97623   0.96702   0.97160  19053041
+#        PF00528    0.75916   0.61719   0.68085   1474398
+#        PF00106    0.95814   0.95516   0.95665  18042236
+#        PF13561    0.96365   0.98093   0.97222   9156078
 
-#    avg / total    0.98974   0.98975   0.98973 1191451616
+#    avg / total    0.99035   0.99037   0.99032 1191621856
+
+#   9602/107590 [=>............................] - ETA: 4:31:43 - loss: 0.2199 - acc: 0.9257(32, 1679) (32, 1679, 1) 1679 1679
 
 # Pfam-A.regions.uniprot.tsv.gz
 #        Region Count:       88761542
@@ -106,6 +116,3 @@ pfam_regions.sparse_train(model, model_name, __file__, num_domain, device='/gpu:
 #              Median:            863
 #             Average:           5311
 #                 Max:        1078482
-
-# 980 Ti Ran out of memory with batch size 64 at
-# 50527/53795 [===========================>..] - ETA: 12:09 - loss: 0.0235 - acc: 0.9914(64, 1357) (64, 1357, 1) 1357 1357
