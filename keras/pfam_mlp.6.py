@@ -65,10 +65,11 @@ if not os.path.exists(classification_report_dir):
         if exc.errno != errno.EEXIST:
             raise
 
+aa_list = 'FLIMVPAWGSTYQNCO*UHKRDEBZX-'
 
 with tf.device('/gpu:0'):
     print('Loading data...')
-    (x_train, y_train_class), (x_test, y_test_class), (aa_list, domain_list) = pfam.load_data(
+    (x_train, y_train_class), (x_test, y_test_class), domain_list = pfam.load_data(
         num_domain=num_domain, test_split=test_split)
     print(len(x_train), 'train sequences')
     print(len(x_test), 'test sequences')
