@@ -1,20 +1,4 @@
 r"""Entry point for trianing a RNN-based classifier for the pfam data.
-
-python train.py \
-  --training_data train_data \
-  --eval_data eval_data \
-  --checkpoint_dir ./checkpoints/ \
-  --cell_type cudnn_lstm
-  
-python main.py train \
-  --dataset pfam_regions \
-  --model_spec rnn_v1 \
-
-python main.py predict \
-  --trained_model rnn_v1 \
-  --input predict_data
-
-When running on GPUs using --cell_type cudnn_lstm is much faster.
 """
 
 from __future__ import absolute_import
