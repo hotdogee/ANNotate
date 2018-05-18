@@ -1,4 +1,20 @@
 r"""Entry point for trianing a RNN-based classifier for the pfam data.
+
+python train.py \
+  --training_data train_data \
+  --eval_data eval_data \
+  --checkpoint_dir ./checkpoints/ \
+  --cell_type cudnn_lstm
+  
+python main.py train \
+  --dataset pfam_regions \
+  --model_spec rnn_v1 \
+
+python main.py predict \
+  --trained_model rnn_v1 \
+  --input predict_data
+
+When running on GPUs using --cell_type cudnn_lstm is much faster.
 """
 
 from __future__ import absolute_import
@@ -564,7 +580,7 @@ def create_estimator_and_specs(run_config):
         # `exporters` will be invoked after each evaluation.
         start_delay_secs=120,
         # Int. Start evaluating after waiting for this many seconds.
-        throttle_secs=60*60
+        throttle_secs=30*60
         # Do not re-evaluate unless the last evaluation was
         # started at least this many seconds ago. Of course, evaluation does not
         # occur if no new checkpoints are available, hence, this is the minimum.
@@ -583,7 +599,7 @@ def main(unused_args):
 
     # Use JIT XLA
     # session_config = tf.ConfigProto(log_device_placement=True)
-    session_config = tf.ConfigProto()
+    session_config = tf.ConfigProto(allow_soft_placement=True)
     if FLAGS.use_jit_xla:
         session_config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1  # pylint: disable=no-member
 
@@ -599,7 +615,7 @@ def main(unused_args):
             tf_random_seed=FLAGS.random_seed, 
             # Random seed for TensorFlow initializers.
             # Setting this value allows consistency between reruns.
-            save_summary_steps=FLAGS.save_summary_steps,  # 1
+            save_summary_steps=FLAGS.save_summary_steps,  # 10
             # The frequency, in number of global steps, that the
             # summaries are written to disk using a default SummarySaverHook. If both
             # `save_summaries_steps` and `save_summaries_secs` are set to `None`, then
@@ -626,7 +642,7 @@ def main(unused_args):
             # kept for every 0.5 hours of training; if `N` is 10, an additional
             # checkpoint is kept for every 10 hours of training.
             # Defaults to 10,000 hours.
-            log_step_count_steps=FLAGS.log_step_count_steps, # 1
+            log_step_count_steps=FLAGS.log_step_count_steps, # 10
             # The frequency, in number of global steps, that the
             # global step/sec will be logged during training.
             session_config=session_config))
@@ -637,7 +653,7 @@ def main(unused_args):
 # python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0-v1
 # full dataset, batchsize=8 NaN loss, batchsize=4 works
 # python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0b4 --num_classes=16715 --batch_size=4
-
+# python main.py --model_dir=./checkpoints/win-d10
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.register('type', 'bool', lambda v: v.lower() == 'true')
