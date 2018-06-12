@@ -23,11 +23,15 @@ from __future__ import print_function
 import argparse
 import ast
 import functools
+import datetime
 import sys
 import os
+from pathlib import Path
 
 import tensorflow as tf
 from tensorflow.contrib.layers.python.layers import adaptive_clipping_fn
+from tensorflow.core.protobuf import rewriter_config_pb2
+from tensorflow.python import debug as tf_debug
 import numpy as np
 
 # Disable cpp warnings
@@ -415,20 +419,51 @@ def model_fn(features, labels, mode, params, config):
             labels=labels, 
             logits=logits
         )
+        # tf.summary.histogram('losses', losses)
         # losses shape=(batch_size, sequence_length), dtype=float32
         mask = tf.to_float(tf.sign(labels)) # 0 = 'PAD'
         masked_losses = losses * mask
         # average across batch_size and sequence_length
         loss = tf.reduce_sum(masked_losses) / tf.to_float(tf.reduce_sum(lengths))
+        # tf.summary.scalar('loss', loss)
+    
+    with tf.variable_scope('metrics'):
+        metrics = {
+            # # true_positives / (true_positives + false_positives)
+            # 'precision': tf.metrics.precision(
+            #     labels=labels, 
+            #     predictions=predictions['classes'], 
+            #     weights=mask,
+            #     name='precision'
+            # ),
+            # # true_positives / (true_positives + false_negatives)
+            # 'recall': tf.metrics.recall(
+            #     labels=labels, 
+            #     predictions=predictions['classes'], 
+            #     weights=mask,
+            #     name='recall'
+            # ),
+            # matches / total
+            'accuracy': tf.metrics.accuracy(
+                labels=labels, 
+                predictions=predictions['classes'], 
+                weights=mask,
+                name='accuracy'
+            )
+        }
+        tf.summary.scalar('accuracy', metrics['accuracy'][1])
+        # currently only works for bool
+        # tf.summary.scalar('precision', metrics['precision'][1])
+        # tf.summary.scalar('recall', metrics['recall'][1])
 
     # optimizer
     with tf.variable_scope('optimizer'):
         # clip_gradients = params.gradient_clipping_norm
         global_step=tf.train.get_global_step()
         clip_gradients = adaptive_clipping_fn(
-            std_factor=2.,
-            decay=0.95,
-            static_max_norm=None,
+            std_factor=params.clip_gradients_std_factor, # 2.
+            decay=params.clip_gradients_decay, # 0.95
+            static_max_norm=params.clip_gradients_static_max_norm, # 6.
             global_step=global_step,
             report_summary=True,
             epsilon=1e-8,
@@ -438,15 +473,15 @@ def model_fn(features, labels, mode, params, config):
             return tf.train.exponential_decay(
                 learning_rate, 
                 global_step,
-                decay_steps=params.decay_steps, # 100000
-                decay_rate=params.decay_rate, # 0.96
+                decay_steps=params.learning_rate_decay_steps, # 27000000
+                decay_rate=params.learning_rate_decay_rate, # 0.95
                 staircase=False,
                 name=None
             )
         train_op = tf.contrib.layers.optimize_loss(
             loss=loss,
             global_step=global_step,
-            learning_rate=params.learning_rate, # 0.1
+            learning_rate=params.learning_rate, # 0.001
             optimizer='Adam',
             gradient_noise_scale=None,
             gradient_multipliers=None,
@@ -457,41 +492,35 @@ def model_fn(features, labels, mode, params, config):
             variables=None,
             name=None,
             summaries=[
+                # 'gradients', 
+                # 'gradient_norm',
+                'loss',
                 'learning_rate', 
-                'loss', 
-                'gradients', 
-                'gradient_norm'
             ],
             colocate_gradients_with_ops=False,
             increment_global_step=True
         )
-
-    scaffold = tf.train.Scaffold(saver = tf.train.Saver(sharded = False, allow_empty = True))
+    # default saver is added in estimator._train_with_estimator_spec
+    # training.Saver(
+    #   sharded=True,
+    #   max_to_keep=self._config.keep_checkpoint_max,
+    #   keep_checkpoint_every_n_hours=(
+    #       self._config.keep_checkpoint_every_n_hours),
+    #   defer_build=True,
+    #   save_relative_paths=True)
+    scaffold = tf.train.Scaffold(saver=tf.train.Saver(
+        sharded=False,
+        max_to_keep=config.keep_checkpoint_max,
+        keep_checkpoint_every_n_hours=(
+            config.keep_checkpoint_every_n_hours),
+        defer_build=True,
+        save_relative_paths=True))
     return tf.estimator.EstimatorSpec(
         mode=mode,
         predictions=predictions,
         loss=loss,
         train_op=train_op,
-        eval_metric_ops={
-            # matches / total
-            'accuracy': tf.metrics.accuracy(
-                labels=labels, 
-                predictions=predictions['classes'], 
-                weights=mask
-            ),
-            # true_positives / (true_positives + false_positives)
-            'precision': tf.metrics.precision(
-                labels=labels, 
-                predictions=predictions['classes'], 
-                weights=mask
-            ),
-            # true_positives / (true_positives + false_negatives)
-            'recall': tf.metrics.recall(
-                labels=labels, 
-                predictions=predictions['classes'], 
-                weights=mask
-            )
-        },
+        eval_metric_ops=metrics,
         export_outputs={
             'predictions': tf.estimator.export.PredictOutput(predictions)
         },
@@ -508,8 +537,20 @@ def model_fn(features, labels, mode, params, config):
 def create_estimator_and_specs(run_config):
     """Creates an Estimator, TrainSpec and EvalSpec."""
     model_params = tf.contrib.training.HParams(
+        model_dir=FLAGS.model_dir,
         num_gpus=FLAGS.num_gpus,
         num_cpu_threads=FLAGS.num_cpu_threads,
+        random_seed=FLAGS.random_seed,
+        use_jit_xla=FLAGS.use_jit_xla,
+        save_summary_steps=FLAGS.save_summary_steps,
+        save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+        keep_checkpoint_max=FLAGS.keep_checkpoint_max,
+        keep_checkpoint_every_n_hours=FLAGS.keep_checkpoint_every_n_hours,
+        log_step_count_steps=FLAGS.log_step_count_steps,
+        eval_delay_secs=FLAGS.eval_delay_secs,
+        eval_throttle_secs=FLAGS.eval_throttle_secs,
+        steps=FLAGS.steps,
+        eval_steps=FLAGS.eval_steps,
 
         tfrecord_pattern={
             tf.estimator.ModeKeys.TRAIN: FLAGS.training_data,
@@ -534,10 +575,14 @@ def create_estimator_and_specs(run_config):
         rnn_num_units=FLAGS.rnn_num_units,
         
         num_classes=FLAGS.num_classes,
+
+        clip_gradients_std_factor=FLAGS.clip_gradients_std_factor, # 2.
+        clip_gradients_decay=FLAGS.clip_gradients_decay, # 0.95
+        clip_gradients_static_max_norm=FLAGS.clip_gradients_static_max_norm, # 6.
         
-        decay_steps=FLAGS.decay_steps,
-        decay_rate=FLAGS.decay_rate,
-        learning_rate=FLAGS.learning_rate
+        learning_rate_decay_steps=FLAGS.learning_rate_decay_steps, # 10000
+        learning_rate_decay_rate=FLAGS.learning_rate_decay_rate, # 0.9
+        learning_rate=FLAGS.learning_rate # 0.001
 
         # num_layers=FLAGS.num_layers,
         # num_conv=ast.literal_eval(FLAGS.num_conv),
@@ -547,10 +592,17 @@ def create_estimator_and_specs(run_config):
         # batch_norm=FLAGS.batch_norm
     )
 
+    # hook = tf_debug.LocalCLIDebugHook()
+
     estimator = tf.estimator.Estimator(
         model_fn=model_fn,
         config=run_config,
         params=model_params)
+
+    # save model_params to model_dir/hparams.json
+    hparams_f = Path(estimator.model_dir, 'hparams-{:%Y-%m-%d-%H-%M-%S}.json'.format(datetime.datetime.now()))
+    hparams_f.parent.mkdir(parents=True)
+    hparams_f.write_text(model_params.to_json(indent=2, sort_keys=False))
 
     train_spec = tf.estimator.TrainSpec(
         input_fn=input_fn, 
@@ -565,7 +617,7 @@ def create_estimator_and_specs(run_config):
     eval_spec = tf.estimator.EvalSpec(
         input_fn=input_fn,
         # A function that constructs the input data for evaluation.
-        steps=10, # 100,
+        steps=FLAGS.eval_steps, # 10
         # Positive number of steps for which to evaluate model. If
         # `None`, evaluates until `input_fn` raises an end-of-input exception.
         name=None,
@@ -578,9 +630,12 @@ def create_estimator_and_specs(run_config):
         exporters=None,
         # Iterable of `Exporter`s, or a single one, or `None`.
         # `exporters` will be invoked after each evaluation.
-        start_delay_secs=120,
+        start_delay_secs=FLAGS.eval_delay_secs, # 30 * 24 * 60 * 60
+        # used for distributed training continuous evaluator only
         # Int. Start evaluating after waiting for this many seconds.
-        throttle_secs=30*60
+        throttle_secs=FLAGS.eval_throttle_secs # 30 * 24 * 60 * 60
+        # full dataset at batch=4 currently needs 15 days
+        # adds a StopAtSecsHook(eval_spec.throttle_secs)
         # Do not re-evaluate unless the last evaluation was
         # started at least this many seconds ago. Of course, evaluation does not
         # occur if no new checkpoints are available, hence, this is the minimum.
@@ -600,6 +655,8 @@ def main(unused_args):
     # Use JIT XLA
     # session_config = tf.ConfigProto(log_device_placement=True)
     session_config = tf.ConfigProto(allow_soft_placement=True)
+    # default session config when init Estimator
+    session_config.graph_options.rewrite_options.meta_optimizer_iterations=rewriter_config_pb2.RewriterConfig.ONE
     if FLAGS.use_jit_xla:
         session_config.graph_options.optimizer_options.global_jit_level = tf.OptimizerOptions.ON_1  # pylint: disable=no-member
 
@@ -639,21 +696,40 @@ def main(unused_args):
             keep_checkpoint_every_n_hours=FLAGS.keep_checkpoint_every_n_hours, # 1
             # keep an additional checkpoint
             # every `N` hours. For example, if `N` is 0.5, an additional checkpoint is
-            # kept for every 0.5 hours of training; if `N` is 10, an additional
-            # checkpoint is kept for every 10 hours of training.
+            # kept for every 0.5 hours of training, this is in addition to the 
+            # keep_checkpoint_max checkpoints.
             # Defaults to 10,000 hours.
             log_step_count_steps=FLAGS.log_step_count_steps, # 10
             # The frequency, in number of global steps, that the
             # global step/sec will be logged during training.
             session_config=session_config))
 
-    tf.estimator.train_and_evaluate(estimator, train_spec, eval_spec)
+    eval_result_metrics, export_results = tf.estimator.train_and_evaluate(
+        estimator, train_spec, eval_spec)
+    # _TrainingExecutor.run()
+    # _TrainingExecutor.run_local()
+    # estimator.train(input_fn, max_steps)
+    # loss = estimator._train_model(input_fn, hooks, saving_listeners)
+    # estimator._train_model_default(input_fn, hooks, saving_listeners)
+    # features, labels, input_hooks = (estimator._get_features_and_labels_from_input_fn(input_fn, model_fn_lib.ModeKeys.TRAIN))
+    # estimator_spec = estimator._call_model_fn(features, labels, model_fn_lib.ModeKeys.TRAIN, estimator.config)
+    # estimator._train_with_estimator_spec(estimator_spec, worker_hooks, hooks, global_step_tensor, saving_listeners)
+    # _, loss = MonitoredTrainingSession.run([estimator_spec.train_op, estimator_spec.loss])
 
-# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d10-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d10-s20-test.tfrecords --model_dir=./checkpoints/v3 --batch_size=64
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d10-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d10-s20-test.tfrecords --model_dir=./checkpoints/cent-d10-v1 --batch_size=64
 # python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0-v1
 # full dataset, batchsize=8 NaN loss, batchsize=4 works
-# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0b4 --num_classes=16715 --batch_size=4
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b4 --num_classes=16715 --batch_size=4 --save_summary_steps=10 --log_step_count_steps=100
 # python main.py --model_dir=./checkpoints/win-d10
+# python main.py --training_data=D:/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=D:/checkpoints/win-d0b4 --num_classes=16715 --batch_size=4 --save_summary_steps=10 --log_step_count_steps=10
+# python main.py --training_data=D:/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=D:/checkpoints/win-d0b4-6 --num_classes=16715 --batch_size=4 --save_summary_steps=100 --log_step_count_steps=100 --learning_rate=0.001
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-2 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=27000000 --decay_rate=0.95 --learning_rate=0.001
+## NaN at 844800 step
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-3 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=13500000 --decay_rate=0.95 --learning_rate=0.001
+## 
+# class count = 16715, sequence count = 54,223,493, batch size = 4, batch count = 13,555,873, batch per sec = 11, time per epoch = 1,232,352 sec = 14 days
+# 1950X: 13.5 step/sec, 8107 step@10min, tf1.9.0, win10
+# titan: 12.8 step/sec, 7675 step@10min, tf1.9.0, centos
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.register('type', 'bool', lambda v: v.lower() == 'true')
@@ -710,7 +786,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--save_summary_steps',
         type=int,
-        default=10,
+        default=100,
         help='Save summaries every this many steps.')
     parser.add_argument(
         '--save_checkpoints_steps',
@@ -737,12 +813,27 @@ if __name__ == '__main__':
         type=int,
         default=100,
         help='The frequency, in number of global steps, that the global step/sec will be logged during training.')
+    parser.add_argument(
+        '--eval_delay_secs',
+        type=int,
+        default=30 * 24 * 60 * 60,
+        help='Start distributed continuous evaluation after waiting for this many seconds. Not used in local training.')
+    parser.add_argument(
+        '--eval_throttle_secs',
+        type=int,
+        default=30 * 24 * 60 * 60,
+        help='Stop training and start evaluation after this many seconds.')
         
     parser.add_argument(
         '--steps',
         type=int,
         default=0, # 100000,
         help='Number of training steps, if 0 train forever.')
+    parser.add_argument(
+        '--eval_steps',
+        type=int,
+        default=100, # 100000,
+        help='Number of evaluation steps, if 0, evaluates until end-of-input.')
     
     parser.add_argument(
         '--dataset_buffer',
@@ -819,51 +910,67 @@ if __name__ == '__main__':
         help='Number of node per recurrent network layer.')
         
     parser.add_argument(
-        '--decay_steps',
+        '--clip_gradients_std_factor',
+        type=float,
+        default=2., # num_batches_per_epoch * num_epochs_per_decay(8)
+        help='If the norm exceeds `exp(mean(log(norm)) + std_factor*std(log(norm)))` then all gradients will be rescaled such that the global norm becomes `exp(mean)`.')
+    parser.add_argument(
+        '--clip_gradients_decay',
+        type=float,
+        default=0.95,
+        help='The smoothing factor of the moving averages.')
+    parser.add_argument(
+        '--clip_gradients_static_max_norm',
+        type=float,
+        default=6.,
+        help='If provided, will threshold the norm to this value as an extra safety.')
+        
+    parser.add_argument(
+        '--learning_rate_decay_steps',
         type=int,
-        default=100000, # num_batches_per_epoch * num_epochs_per_decay(8)
+        default=27000000, # num_batches_per_epoch * num_epochs_per_decay(8)
         help='Decay learning_rate by decay_rate every decay_steps.')
     parser.add_argument(
-        '--decay_rate',
+        '--learning_rate_decay_rate',
         type=float,
-        default=0.96,
+        default=0.95,
         help='Learning rate decay rate.')
     parser.add_argument(
         '--learning_rate',
         type=float,
-        default=0.01,
+        default=0.001,
         help='Learning rate used for training.')
 
-    parser.add_argument(
-        '--num_layers',
-        type=int,
-        default=3,
-        help='Number of recurrent neural network layers.')
-    parser.add_argument(
-        '--num_conv',
-        type=str,
-        default='[48, 64, 96]',
-        help='Number of conv layers along with number of filters per layer.')
-    parser.add_argument(
-        '--conv_len',
-        type=str,
-        default='[5, 5, 3]',
-        help='Length of the convolution filters.')
-    parser.add_argument(
-        '--gradient_clipping_norm',
-        type=float,
-        default=9.0,
-        help='Gradient clipping norm used during training.')
-    parser.add_argument(
-        '--cell_type',
-        type=str,
-        default='lstm',
-        help='Cell type used for rnn layers: cudnn_lstm, lstm or block_lstm.')
-    parser.add_argument(
-        '--batch_norm',
-        type='bool',
-        default='False',
-        help='Whether to enable batch normalization or not.')
+    # parser.add_argument(
+    #     '--num_layers',
+    #     type=int,
+    #     default=3,
+    #     help='Number of recurrent neural network layers.')
+    # parser.add_argument(
+    #     '--num_conv',
+    #     type=str,
+    #     default='[48, 64, 96]',
+    #     help='Number of conv layers along with number of filters per layer.')
+    # parser.add_argument(
+    #     '--conv_len',
+    #     type=str,
+    #     default='[5, 5, 3]',
+    #     help='Length of the convolution filters.')
+    # parser.add_argument(
+    #     '--gradient_clipping_norm',
+    #     type=float,
+    #     default=9.0,
+    #     help='Gradient clipping norm used during training.')
+    # parser.add_argument(
+    #     '--cell_type',
+    #     type=str,
+    #     default='lstm',
+    #     help='Cell type used for rnn layers: cudnn_lstm, lstm or block_lstm.')
+    # parser.add_argument(
+    #     '--batch_norm',
+    #     type='bool',
+    #     default='False',
+    #     help='Whether to enable batch normalization or not.')
 
     FLAGS, unparsed = parser.parse_known_args()
     tf.app.run(main=main, argv=[sys.argv[0]] + unparsed)
