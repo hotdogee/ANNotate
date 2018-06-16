@@ -470,14 +470,25 @@ def model_fn(features, labels, mode, params, config):
             name=None
         )
         def learning_rate_decay_fn(learning_rate, global_step):
-            return tf.train.exponential_decay(
+            return tf.train.noisy_linear_cosine_decay(
                 learning_rate, 
                 global_step,
                 decay_steps=params.learning_rate_decay_steps, # 27000000
-                decay_rate=params.learning_rate_decay_rate, # 0.95
-                staircase=False,
+                initial_variance=1.0,
+                variance_decay=0.55,
+                num_periods=0.5,
+                alpha=0.0,
+                beta=0.001,
                 name=None
             )
+            # return tf.train.exponential_decay(
+            #     learning_rate, 
+            #     global_step,
+            #     decay_steps=params.learning_rate_decay_steps, # 27000000
+            #     decay_rate=params.learning_rate_decay_rate, # 0.95
+            #     staircase=False,
+            #     name=None
+            # )
         train_op = tf.contrib.layers.optimize_loss(
             loss=loss,
             global_step=global_step,
@@ -515,6 +526,20 @@ def model_fn(features, labels, mode, params, config):
             config.keep_checkpoint_every_n_hours),
         defer_build=True,
         save_relative_paths=True))
+    
+    training_hooks = []
+    training_hooks.append(tf.train.StepCounterHook(
+        output_dir=params.model_dir, 
+        every_n_steps=params.log_step_count_steps
+    ))
+    training_hooks.append(tf.train.LoggingTensorHook(
+        tensors={
+            'accuracy': metrics['accuracy'][1],
+            'loss': loss,
+            'step': global_step
+        },
+        every_n_iter=params.log_step_count_steps
+    ))
     return tf.estimator.EstimatorSpec(
         mode=mode,
         predictions=predictions,
@@ -524,9 +549,9 @@ def model_fn(features, labels, mode, params, config):
         export_outputs={
             'predictions': tf.estimator.export.PredictOutput(predictions)
         },
-        training_chief_hooks=None,
-        training_hooks=None,
         scaffold=scaffold,
+        training_chief_hooks=None,
+        training_hooks=training_hooks,
         evaluation_hooks=None,
         prediction_hooks=None
     )
@@ -582,7 +607,8 @@ def create_estimator_and_specs(run_config):
         
         learning_rate_decay_steps=FLAGS.learning_rate_decay_steps, # 10000
         learning_rate_decay_rate=FLAGS.learning_rate_decay_rate, # 0.9
-        learning_rate=FLAGS.learning_rate # 0.001
+        learning_rate=FLAGS.learning_rate, # 0.001
+        learning_rate_decay_fn='noisy_linear_cosine_decay'
 
         # num_layers=FLAGS.num_layers,
         # num_conv=ast.literal_eval(FLAGS.num_conv),
@@ -601,7 +627,7 @@ def create_estimator_and_specs(run_config):
 
     # save model_params to model_dir/hparams.json
     hparams_f = Path(estimator.model_dir, 'hparams-{:%Y-%m-%d-%H-%M-%S}.json'.format(datetime.datetime.now()))
-    hparams_f.parent.mkdir(parents=True)
+    hparams_f.parent.mkdir(parents=True, exist_ok=True)
     hparams_f.write_text(model_params.to_json(indent=2, sort_keys=False))
 
     train_spec = tf.estimator.TrainSpec(
@@ -699,7 +725,8 @@ def main(unused_args):
             # kept for every 0.5 hours of training, this is in addition to the 
             # keep_checkpoint_max checkpoints.
             # Defaults to 10,000 hours.
-            log_step_count_steps=FLAGS.log_step_count_steps, # 10
+            log_step_count_steps=None, # Customized LoggingTensorHook defined in model_fn
+            # log_step_count_steps=FLAGS.log_step_count_steps, # 10
             # The frequency, in number of global steps, that the
             # global step/sec will be logged during training.
             session_config=session_config))
@@ -726,7 +753,27 @@ def main(unused_args):
 # python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-2 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=27000000 --decay_rate=0.95 --learning_rate=0.001
 ## NaN at 844800 step
 # python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-3 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=13500000 --decay_rate=0.95 --learning_rate=0.001
-## 
+## NaN at 490000 step
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-4 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.1
+## NaN at 
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-5 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.01
+## NaN at 400
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-6 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.005
+## NaN at 20000
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-7 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.001
+## NaN at 553400
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-8 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.0008
+## NaN at 1368600
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-9 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.0007
+## NaN at 1259000
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-10 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.0006
+## NaN at 1268600
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-11 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.0005
+## NaN at 2584200
+# python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-12 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.0004
+## NaN at 
+# python main.py --training_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0b2-13-5930k --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.0003
+## NaN at 
 # class count = 16715, sequence count = 54,223,493, batch size = 4, batch count = 13,555,873, batch per sec = 11, time per epoch = 1,232,352 sec = 14 days
 # 1950X: 13.5 step/sec, 8107 step@10min, tf1.9.0, win10
 # titan: 12.8 step/sec, 7675 step@10min, tf1.9.0, centos
@@ -801,12 +848,12 @@ if __name__ == '__main__':
     parser.add_argument(
         '--keep_checkpoint_max',
         type=int,
-        default=10,
+        default=5,
         help='The maximum number of recent checkpoint files to keep.')
     parser.add_argument(
         '--keep_checkpoint_every_n_hours',
         type=float,
-        default=1,
+        default=6,
         help='Keep an additional checkpoint every `N` hours.')
     parser.add_argument(
         '--log_step_count_steps',
