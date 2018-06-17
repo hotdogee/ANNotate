@@ -632,8 +632,6 @@ def create_estimator_and_specs(run_config):
         eval_throttle_secs=FLAGS.eval_throttle_secs,
         steps=FLAGS.steps,
         eval_steps=FLAGS.eval_steps,
-        check_nans=FLAGS.check_nans,
-        debug=FLAGS.debug,
 
         tfrecord_pattern={
             tf.estimator.ModeKeys.TRAIN: FLAGS.training_data,
@@ -668,8 +666,10 @@ def create_estimator_and_specs(run_config):
         learning_rate=FLAGS.learning_rate, # 0.001
         learning_rate_decay_fn='noisy_linear_cosine_decay',
         optimizer=FLAGS.optimizer,
-        adam_epsilon=FLAGS.adam_epsilon
+        adam_epsilon=FLAGS.adam_epsilon,
 
+        check_nans=FLAGS.check_nans,
+        debug=FLAGS.debug
         # num_layers=FLAGS.num_layers,
         # num_conv=ast.literal_eval(FLAGS.num_conv),
         # conv_len=ast.literal_eval(FLAGS.conv_len),
@@ -936,16 +936,6 @@ if __name__ == '__main__':
         type=int,
         default=30 * 24 * 60 * 60,
         help='Stop training and start evaluation after this many seconds.')
-    parser.add_argument(
-        '--check_nans',
-        type='bool',
-        default='True',
-        help='Add runtime checks to spot when NaNs or other symptoms of numerical errors start occurring during training.')
-    parser.add_argument(
-        '--debug',
-        type='bool',
-        default='True',
-        help='Run debugging ops.')
         
     parser.add_argument(
         '--steps',
@@ -1075,7 +1065,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--optimizer',
         type=str,
-        default='Adagrad',
+        default='Adam',
         help='Optimizer to use. One of "Adagrad", "Adam", "Ftrl", "Momentum", "RMSProp", "SGD"')
     parser.add_argument(
         '--adam_epsilon',
@@ -1083,6 +1073,16 @@ if __name__ == '__main__':
         default=0.1,
         help='A small constant for numerical stability. This epsilon is "epsilon hat" in the Kingma and Ba paper (in the formula just before Section 2.1), not the epsilon in Algorithm 1 of the paper.')
 
+    parser.add_argument(
+        '--check_nans',
+        type='bool',
+        default='False',
+        help='Add runtime checks to spot when NaNs or other symptoms of numerical errors start occurring during training.')
+    parser.add_argument(
+        '--debug',
+        type='bool',
+        default='False',
+        help='Run debugging ops.')
     # parser.add_argument(
     #     '--num_layers',
     #     type=int,
