@@ -4,7 +4,7 @@ from __future__ import print_function
 
 from datasets import pfam_regions
 from keras.models import Sequential
-from keras.layers import Embedding, Dropout, TimeDistributed
+from tensorflow.keras.layers import Embedding, Dropout, TimeDistributed
 from keras.layers import Conv1D, GlobalMaxPooling1D, MaxPooling1D
 from keras.layers import Dense, Activation, LSTM, Bidirectional
 from keras.layers import CuDNNGRU, CuDNNLSTM

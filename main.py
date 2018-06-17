@@ -215,6 +215,24 @@ def input_fn(mode, params, config):
 
     return dataset
 
+class CheckpointSaverHook(tf.train.CheckpointSaverHook):
+  """Saves checkpoints every N steps or seconds.
+  Fixes more than one graph event per run warning in Tensorboard
+  """
+
+  def after_create_session(self, session, coord):
+    global_step = session.run(self._global_step_tensor)
+    # We do write graph and saver_def at the first call of before_run.
+    # We cannot do this in begin, since we let other hooks to change graph and
+    # add variables in begin. Graph is finalized after all begin calls.
+    tf.train.write_graph(
+        tf.get_default_graph().as_graph_def(add_shapes=True),
+        self._checkpoint_dir,
+        "graph.pbtxt")
+    # The checkpoint saved here is the state at step "global_step".
+    self._save(session, global_step)
+    self._timer.update_last_triggered_step(global_step)
+
 # num_domain = 10
 # test_split = 0.2
 # validation_split = 0.1
@@ -287,13 +305,19 @@ def model_fn(features, labels, mode, params, config):
     # protein shape=(batch_size, sequence_length), dtype=int32
     lengths = features['lengths']
     # lengths shape=(batch_size, ), dtype=int32
+    global_step=tf.train.get_global_step()
     # Embedding layer
     with tf.variable_scope('embedding_1', values=[features]):
         embeddings = tf.contrib.framework.model_variable(
             name='embeddings', 
             shape=[params.vocab_size, params.embed_dim],
             dtype=tf.float32, # default: tf.float32
-            initializer=None, # default: tf.glorot_uniform_initializer(seed=None, dtype=tf.float32)
+            # initializer=None, # default: tf.glorot_uniform_initializer(seed=None, dtype=tf.float32)
+            initializer=tf.random_uniform_initializer(
+                minval=-0.5,
+                maxval=0.5,
+                dtype=tf.float32
+            ),
             trainable=True,
         ) # vocab_size * embed_dim = 28 * 32 = 896
         # tf.Variable 'embedding_matrix:0' shape=(vocab_size, embed_dim) dtype=float32
@@ -306,7 +330,9 @@ def model_fn(features, labels, mode, params, config):
         dropped_embedded = tf.layers.dropout(
             inputs=embedded, 
             rate=params.embedded_dropout, # 0.2
-            noise_shape=None, # [batch_size, 1, embed_dim]
+            # noise_shape=None, # [batch_size, 1, embed_dim]
+            noise_shape=[params.batch_size, 1, params.embed_dim], # drop embedding
+            # noise_shape=[params.batch_size, tf.shape(embedded)[1], 1], # drop word 
             training=is_train,
             name='dropout'
         )
@@ -371,22 +397,22 @@ def model_fn(features, labels, mode, params, config):
         # )
         # # outputs shape=(batch_size, sequence_length, params.rnn_num_units * 2), dtype=float32
         ###############
-        convolved = tf.transpose(dropped_convolved, [1, 0, 2])
+        transposed_convolved = tf.transpose(dropped_convolved, [1, 0, 2])
         lstm = tf.contrib.cudnn_rnn.CudnnGRU(
             num_layers=1,
             num_units=params.rnn_num_units,
             direction="bidirectional",
             name='CudnnGRU1'
         )
-        outputs, _ = lstm(convolved)
+        outputs, _ = lstm(transposed_convolved)
         # Convert back from time-major outputs to batch-major outputs.
-        outputs = tf.transpose(outputs, [1, 0, 2])
+        transposed_outputs = tf.transpose(outputs, [1, 0, 2])
 
     
     # output layer
     with tf.variable_scope('output_1'):
         logits = tf.layers.dense(
-            inputs=outputs, 
+            inputs=transposed_outputs, 
             units=params.num_classes,
             activation=None,
             use_bias=True,
@@ -456,10 +482,26 @@ def model_fn(features, labels, mode, params, config):
         # tf.summary.scalar('precision', metrics['precision'][1])
         # tf.summary.scalar('recall', metrics['recall'][1])
 
+    # optimizer list
+    optimizers = {
+        'Adagrad': tf.train.AdagradOptimizer,
+        'Adam': lambda lr: tf.train.AdamOptimizer(lr, epsilon=params.adam_epsilon),
+        'Nadam': lambda lr: tf.contrib.opt.NadamOptimizer(lr, epsilon=params.adam_epsilon),
+        'Ftrl': tf.train.FtrlOptimizer,
+        'Momentum': lambda lr: tf.train.MomentumOptimizer(lr, momentum=0.9),
+        'RMSProp': tf.train.RMSPropOptimizer,
+        'SGD': tf.train.GradientDescentOptimizer,
+    }
+    
+    # runtime numerical checks
+    control_inputs = []
+    if params.check_nans:
+        checks = tf.add_check_numerics_ops()
+        control_inputs = [checks]
+
     # optimizer
-    with tf.variable_scope('optimizer'):
+    with tf.variable_scope('optimizer'), tf.control_dependencies(control_inputs):
         # clip_gradients = params.gradient_clipping_norm
-        global_step=tf.train.get_global_step()
         clip_gradients = adaptive_clipping_fn(
             std_factor=params.clip_gradients_std_factor, # 2.
             decay=params.clip_gradients_decay, # 0.95
@@ -493,7 +535,7 @@ def model_fn(features, labels, mode, params, config):
             loss=loss,
             global_step=global_step,
             learning_rate=params.learning_rate, # 0.001
-            optimizer='Adam',
+            optimizer=optimizers[params.optimizer],
             gradient_noise_scale=None,
             gradient_multipliers=None,
             # some gradient clipping stabilizes training in the beginning.
@@ -510,6 +552,20 @@ def model_fn(features, labels, mode, params, config):
             ],
             colocate_gradients_with_ops=False,
             increment_global_step=True
+        )
+    if params.debug:
+        train_op = tf.cond(
+            pred=tf.logical_or(
+                tf.is_nan(tf.reduce_max(embeddings)),
+                tf.equal(global_step, 193000)
+            ), 
+            false_fn=lambda: train_op, 
+            true_fn=lambda: tf.Print(train_op, 
+                # data=[global_step, metrics['accuracy'][0], lengths, loss, losses, predictions['classes'], labels, mask, protein, embeddings],
+                data=[global_step, metrics['accuracy'][0], lengths, loss, embeddings],
+                message='## DEBUG LOSS: ',
+                summarize=50000
+            )
         )
     # default saver is added in estimator._train_with_estimator_spec
     # training.Saver(
@@ -576,6 +632,8 @@ def create_estimator_and_specs(run_config):
         eval_throttle_secs=FLAGS.eval_throttle_secs,
         steps=FLAGS.steps,
         eval_steps=FLAGS.eval_steps,
+        check_nans=FLAGS.check_nans,
+        debug=FLAGS.debug,
 
         tfrecord_pattern={
             tf.estimator.ModeKeys.TRAIN: FLAGS.training_data,
@@ -608,7 +666,9 @@ def create_estimator_and_specs(run_config):
         learning_rate_decay_steps=FLAGS.learning_rate_decay_steps, # 10000
         learning_rate_decay_rate=FLAGS.learning_rate_decay_rate, # 0.9
         learning_rate=FLAGS.learning_rate, # 0.001
-        learning_rate_decay_fn='noisy_linear_cosine_decay'
+        learning_rate_decay_fn='noisy_linear_cosine_decay',
+        optimizer=FLAGS.optimizer,
+        adam_epsilon=FLAGS.adam_epsilon
 
         # num_layers=FLAGS.num_layers,
         # num_conv=ast.literal_eval(FLAGS.num_conv),
@@ -773,7 +833,13 @@ def main(unused_args):
 # python main.py --training_data=/home/hotdogee/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/hotdogee/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/cent-d0b2-12 --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.0004
 ## NaN at 
 # python main.py --training_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0b2-13-5930k --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.0003
-## NaN at 
+## OOM at 351600
+# python main.py --training_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0b1-1-5930k --num_classes=16715 --batch_size=1 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.0003
+## DataLossError at 570200
+# python main.py --training_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0b1-2-5930k --num_classes=16715 --batch_size=1 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.0003
+## DataLossError at 
+# python main.py --training_data=D:\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0b2nan-1-1950x --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.01
+## NaN at 400
 # class count = 16715, sequence count = 54,223,493, batch size = 4, batch count = 13,555,873, batch per sec = 11, time per epoch = 1,232,352 sec = 14 days
 # 1950X: 13.5 step/sec, 8107 step@10min, tf1.9.0, win10
 # titan: 12.8 step/sec, 7675 step@10min, tf1.9.0, centos
@@ -870,6 +936,16 @@ if __name__ == '__main__':
         type=int,
         default=30 * 24 * 60 * 60,
         help='Stop training and start evaluation after this many seconds.')
+    parser.add_argument(
+        '--check_nans',
+        type='bool',
+        default='True',
+        help='Add runtime checks to spot when NaNs or other symptoms of numerical errors start occurring during training.')
+    parser.add_argument(
+        '--debug',
+        type='bool',
+        default='True',
+        help='Run debugging ops.')
         
     parser.add_argument(
         '--steps',
@@ -987,6 +1063,25 @@ if __name__ == '__main__':
         type=float,
         default=0.001,
         help='Learning rate used for training.')
+    # learning rate defaults
+    # Adagrad: 0.01
+    # Adam: 0.001
+    # RMSProp: 0.001
+    # : 
+    # Nadam: 0.002
+    # SGD: 0.01
+    # Adamax: 0.002
+    # Adadelta: 1.0 
+    parser.add_argument(
+        '--optimizer',
+        type=str,
+        default='Adagrad',
+        help='Optimizer to use. One of "Adagrad", "Adam", "Ftrl", "Momentum", "RMSProp", "SGD"')
+    parser.add_argument(
+        '--adam_epsilon',
+        type=float,
+        default=0.1,
+        help='A small constant for numerical stability. This epsilon is "epsilon hat" in the Kingma and Ba paper (in the formula just before Section 2.1), not the epsilon in Algorithm 1 of the paper.')
 
     # parser.add_argument(
     #     '--num_layers',
