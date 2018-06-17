@@ -484,13 +484,13 @@ def model_fn(features, labels, mode, params, config):
 
     # optimizer list
     optimizers = {
-        'Adagrad': tf.train.AdagradOptimizer,
-        'Adam': lambda lr: tf.train.AdamOptimizer(lr, epsilon=params.adam_epsilon),
-        'Nadam': lambda lr: tf.contrib.opt.NadamOptimizer(lr, epsilon=params.adam_epsilon),
-        'Ftrl': tf.train.FtrlOptimizer,
-        'Momentum': lambda lr: tf.train.MomentumOptimizer(lr, momentum=0.9),
-        'RMSProp': tf.train.RMSPropOptimizer,
-        'SGD': tf.train.GradientDescentOptimizer,
+        'adagrad': tf.train.AdagradOptimizer,
+        'adam': lambda lr: tf.train.AdamOptimizer(lr, epsilon=params.adam_epsilon),
+        'nadam': lambda lr: tf.contrib.opt.NadamOptimizer(lr, epsilon=params.adam_epsilon),
+        'ftrl': tf.train.FtrlOptimizer,
+        'momentum': lambda lr: tf.train.MomentumOptimizer(lr, momentum=0.9),
+        'rmsprop': tf.train.RMSPropOptimizer,
+        'sgd': tf.train.GradientDescentOptimizer,
     }
     
     # runtime numerical checks
@@ -535,7 +535,7 @@ def model_fn(features, labels, mode, params, config):
             loss=loss,
             global_step=global_step,
             learning_rate=params.learning_rate, # 0.001
-            optimizer=optimizers[params.optimizer],
+            optimizer=optimizers[params.optimizer.lower()],
             gradient_noise_scale=None,
             gradient_multipliers=None,
             # some gradient clipping stabilizes training in the beginning.
@@ -596,6 +596,13 @@ def model_fn(features, labels, mode, params, config):
         },
         every_n_iter=params.log_step_count_steps
     ))
+    if params.trace:
+        training_hooks.append(tf.train.ProfilerHook(
+            save_steps=params.save_summary_steps,
+            output_dir=params.model_dir,
+            show_dataflow=True,
+            show_memory=True
+        ))
     return tf.estimator.EstimatorSpec(
         mode=mode,
         predictions=predictions,
@@ -669,6 +676,7 @@ def create_estimator_and_specs(run_config):
         adam_epsilon=FLAGS.adam_epsilon,
 
         check_nans=FLAGS.check_nans,
+        trace=FLAGS.trace,
         debug=FLAGS.debug
         # num_layers=FLAGS.num_layers,
         # num_conv=ast.literal_eval(FLAGS.num_conv),
@@ -840,6 +848,10 @@ def main(unused_args):
 ## DataLossError at 
 # python main.py --training_data=D:\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0b2nan-1-1950x --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.01
 ## NaN at 400
+# python main.py --training_data=D:\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=D:\checkpoints/d0b2-2-1950x --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.001 --check_nans=False --optimizer=adam
+# python main.py --training_data=D:\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=D:\checkpoints/d0b2-2-1950x-xla --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.001 --check_nans=False --optimizer=adam --use_jit_xla=true
+# python main.py --training_data=D:\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=D:\checkpoints/d0b2-3-1950x-trace --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.001 --check_nans=False --optimizer=adam --trace=true
+# python main.py --training_data=D:\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=D:\checkpoints/d0b2-3-1950x-trace --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.001 --check_nans=False --optimizer=adam
 # class count = 16715, sequence count = 54,223,493, batch size = 4, batch count = 13,555,873, batch per sec = 11, time per epoch = 1,232,352 sec = 14 days
 # 1950X: 13.5 step/sec, 8107 step@10min, tf1.9.0, win10
 # titan: 12.8 step/sec, 7675 step@10min, tf1.9.0, centos
@@ -1078,6 +1090,11 @@ if __name__ == '__main__':
         type='bool',
         default='False',
         help='Add runtime checks to spot when NaNs or other symptoms of numerical errors start occurring during training.')
+    parser.add_argument(
+        '--trace',
+        type='bool',
+        default='False',
+        help='Captures CPU/GPU profiling information in "timeline-<step>.json", which are in Chrome Trace format.')
     parser.add_argument(
         '--debug',
         type='bool',
