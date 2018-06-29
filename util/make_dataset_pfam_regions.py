@@ -1,9 +1,11 @@
 
 import os
+import math
 import gzip
-import json
+import ujson
 import struct
 import argparse
+from pathlib import Path
 from collections import defaultdict
 
 import numpy as np
@@ -20,7 +22,6 @@ def _gzip_size(filename):
 def _fa_gz_to_dict(fa_path):
     """Parse a FASTA.gz file into fa_dict[seq_id] = sequence
     """
-    print('Parsing {}'.format(os.path.basename(fa_path)))
     fa_dict = {}
     seq_id, sequence = '', ''
     target = _gzip_size(fa_path)
@@ -49,7 +50,7 @@ def _fa_gz_to_dict(fa_path):
                 sequence += line
         if sequence:
             fa_dict[seq_id] = sequence
-        prog.update(fa_f.tell(), force=True)
+        prog.update(fa_f.tell())
     return fa_dict
 
 
@@ -77,7 +78,7 @@ def _pfam_regions_tsv_gz_to_dict(tsv_path):
             tokens = line.strip().decode('utf-8').split()
             seq_id = '{}.{}'.format(tokens[0], tokens[1])
             domain_regions_dict[tokens[4]].append((seq_id, int(tokens[5]), int(tokens[6])))
-        prog.update(tsv_f.tell(), force=True)
+        prog.update(tsv_f.tell())
     return domain_regions_dict
 
 aa_list = 'FLIMVPAWGSTYQNCO*UHKRDEBZX-'
@@ -87,6 +88,7 @@ def load_data(uniprot_file='uniprot.gz',
               origin_base='ftp://ftp.ebi.ac.uk/pub/databases/Pfam/releases/Pfam31.0/',
               num_domain=10,
               test_split=0.2,
+              max_seq_per_class=None,
               seed=113,
               index_from=1,
               cache_subdir='datasets',
@@ -125,91 +127,232 @@ def load_data(uniprot_file='uniprot.gz',
                     cache_subdir=cache_subdir, cache_dir=cache_dir)
 
     # check cache
-    seq_dom_split_cache_path = '{0}-d{1}-s{2}.npz'.format(os.path.splitext(
-        os.path.splitext(regions_path)[0])[0], num_domain or 0, int(test_split * 100))
-    if os.path.exists(seq_dom_split_cache_path):
-        print('Loading {0}'.format(seq_dom_split_cache_path))
-        f = np.load(seq_dom_split_cache_path)
-        x_train = f['x_train']
-        y_train = f['y_train']
-        maxlen_train = f['maxlen_train'].tolist()
-        x_test = f['x_test']
-        y_test = f['y_test']
-        maxlen_test = f['maxlen_test'].tolist()
-        domain_list = f['domain_list']
+    # seq_dom_split_cache_path = '{0}-d{1}-s{2}.npz'.format(os.path.splitext(
+    #     os.path.splitext(regions_path)[0])[0], num_domain or 0, int(test_split * 100))
+    # if os.path.exists(seq_dom_split_cache_path):
+    #     print('Loading {0}'.format(seq_dom_split_cache_path))
+    #     f = np.load(seq_dom_split_cache_path)
+    #     x_train = f['x_train']
+    #     y_train = f['y_train']
+    #     maxlen_train = f['maxlen_train'].tolist()
+    #     x_test = f['x_test']
+    #     y_test = f['y_test']
+    #     maxlen_test = f['maxlen_test'].tolist()
+    #     domain_list = f['domain_list']
+    # else:
+    #     print('Building {0}'.format(seq_dom_split_cache_path))
+    #     seq_dom_cache_path = '{0}-d{1}.npz'.format(os.path.splitext(
+    #         os.path.splitext(regions_path)[0])[0], num_domain or 0)
+    #     if os.path.exists(seq_dom_cache_path):
+    #         print('Loading {0}'.format(seq_dom_cache_path))
+    #         f = np.load(seq_dom_cache_path)
+    #         domain_list = f['domain_list']
+    #         domains = f['domains']
+    #         sequences = f['sequences']
+    #     else:
+    #         print('Building {0}'.format(seq_dom_cache_path))
+
+    print('Loading Protein Sequence Data from ', end="")
+    # seq_dict[seq_id] = sequence
+    seq_dict_cache_path = '{0}.json'.format(os.path.splitext(uniprot_path)[0])
+    if os.path.exists(seq_dict_cache_path):
+        print('CACHE: {0}'.format(seq_dict_cache_path))
+        with open(seq_dict_cache_path, 'r') as f:
+            seq_dict = ujson.load(f)
     else:
-        print('Building {0}'.format(seq_dom_split_cache_path))
-        seq_dom_cache_path = '{0}-d{1}.npz'.format(os.path.splitext(
-            os.path.splitext(regions_path)[0])[0], num_domain or 0)
-        if os.path.exists(seq_dom_cache_path):
-            print('Loading {0}'.format(seq_dom_cache_path))
-            f = np.load(seq_dom_cache_path)
-            domain_list = f['domain_list']
-            domains = f['domains']
-            sequences = f['sequences']
+        print('SOURCE: {0}'.format(uniprot_path))
+        seq_dict = _fa_gz_to_dict(uniprot_path)
+        # with open(seq_dict_cache_path, 'w') as f:
+        #     ujson.dump(seq_dict, f)
+    # seq_dict stats
+    seq_lengths = sorted([len(s) for s in seq_dict.values()])
+    print('Loaded {:,} Sequences, ({:,}, {:,}, {:,}, {:,}) = (min, median, max, total)'.format(
+        len(seq_lengths), seq_lengths[0], seq_lengths[len(seq_lengths)//2], seq_lengths[-1], sum(seq_lengths)))
+    # Loaded 71,201,428 Sequences, (2, 267, 36,805, 23,867,549,122) = (min, median, max, total)
+    
+    print('Loading Domain Region Data from ', end="")
+    # domain_regions_dict[pfamA_acc] = [(uniprot_acc + '.' + seq_version, seq_start, seq_end), ...]
+    domain_regions_dict_cache_path = '{0}.json'.format(os.path.splitext(regions_path)[0])
+    if os.path.exists(domain_regions_dict_cache_path):
+        print('CACHE: {0}'.format(domain_regions_dict_cache_path))
+        with open(domain_regions_dict_cache_path, 'r') as f:
+            domain_regions_dict = ujson.load(f)
+    else:
+        print('SOURCE: {0}'.format(regions_path))
+        domain_regions_dict = _pfam_regions_tsv_gz_to_dict(regions_path)
+        # with open(domain_regions_dict_cache_path, 'w') as f:
+        #     ujson.dump(domain_regions_dict, f)
+    # domain_regions_dict stats
+    domain_lengths = sorted([len(s) for s in domain_regions_dict.values()])
+    print('Loaded {:,} Domains, ({:,}, {:,}, {:,}, {:,}) = (min, median, max, total)'.format(
+        len(domain_lengths), domain_lengths[0], domain_lengths[len(domain_lengths)//2], domain_lengths[-1], sum(domain_lengths)))
+    # Loaded 16,712 Domains, (2, 863, 1,078,482, 88,761,542) = (min, median, max, total)
+
+    # build domain_seq_dict
+
+    # seq_regions_dict[seq_id] = [(pfamA_acc, seq_start, seq_end), ...]
+    seq_regions_dict = defaultdict(list)
+    # domain_seq_dict[pfamA_acc][seq_id] = [(pfamA_acc, seq_start, seq_end), ...]
+    domain_seq_dict = defaultdict(dict)
+    # domains with the most sequences first
+    num_domains_wanted = num_domain or len(domain_regions_dict)
+    print('Collecting Sequences Containing the Top {} Domains'.format(num_domains_wanted))
+    prog = tf.keras.utils.Progbar(num_domains_wanted)
+    for i, pfamA_acc in enumerate(sorted(domain_regions_dict, key=lambda k: (len(domain_regions_dict[k]), k), reverse=True)):
+        if num_domain and i >= num_domain:
+            break
+        prog.update(i)
+        for seq_id, seq_start, seq_end in domain_regions_dict[pfamA_acc]:
+            seq_regions_dict[seq_id].append((pfamA_acc, seq_start, seq_end))
+            if seq_id not in domain_seq_dict[pfamA_acc]:
+                domain_seq_dict[pfamA_acc][seq_id] = seq_regions_dict[seq_id]
+    prog.update(num_domains_wanted)
+    print('Collected {:,} Sequences with {:,} Domains'.format(len(seq_regions_dict), len(domain_seq_dict)))
+    # Collected 54223493 Sequences with 16712 Domains
+
+    # create train test split for every domain
+    domain_list = []
+    train_set = set()
+    test_set = set()
+    np.random.seed(seed)
+    status_text = 'Distributing Sequences to Training and Testing Sets with {:.0%} Split'.format(test_split)
+    if max_seq_per_class:
+        status_text += ' and Max {} Sequences per Domain per Set'.format(max_seq_per_class)
+    print(status_text)
+    prog = tf.keras.utils.Progbar(len(domain_seq_dict))
+    # assign domains with fewer sequences first
+    for i, pfamA_acc in enumerate(sorted(domain_seq_dict, key=lambda k: (len(domain_seq_dict[k]), k))):
+        prog.update(i)
+        seq_count = len(domain_seq_dict[pfamA_acc])
+        if seq_count < 2: # need at least 2 sequences
+            continue
+        domain_list.append(pfamA_acc)
+        # calculate expected train test counts
+        if test_split < 0.5:
+            test_count = math.ceil(seq_count * test_split)
         else:
-            print('Building {0}'.format(seq_dom_cache_path))
-            # seq_dict[seq_id] = sequence
-            seq_dict_cache_path = '{0}.json'.format(os.path.splitext(uniprot_path)[0])
-            if os.path.exists(seq_dict_cache_path):
-                print('Loading {0}'.format(seq_dict_cache_path))
-                with open(seq_dict_cache_path, 'r') as f:
-                    seq_dict = json.load(f)
-            else:
-                print('Building {0}'.format(seq_dict_cache_path))
-                seq_dict = _fa_gz_to_dict(uniprot_path)
-                with open(seq_dict_cache_path, 'w') as f:
-                    json.dump(seq_dict, f)
+            test_count = int(seq_count * test_split)
+        train_count = seq_count - test_count
+        # check sequences already in train_set and test_set
+        all_seq_set = set(domain_seq_dict[pfamA_acc])
+        test_count -= len(test_set & all_seq_set)
+        train_count -= len(train_set & all_seq_set)
+        seq_list = list(all_seq_set - test_set - train_set)
+        # assert counts
+        if test_count < 0 or train_count < 0:
+            print('ERROR: {}={}, seq_count={}, test_count={}, train_count={}, already in test_set: {}, already in train_set: {}'.format(
+                i, pfamA_acc, seq_count, test_count, train_count, test_set & all_seq_set, train_set & all_seq_set
+            ))
+        np.random.shuffle(seq_list)
+        # limit max_seq_per_class
+        if max_seq_per_class:
+            test_count = min(test_count, max_seq_per_class)
+            train_count = min(train_count, max_seq_per_class)
+        # add selected sequences to train and test sets
+        test_set |= set(seq_list[len(seq_list)-test_count:])
+        train_set |= set(seq_list[:train_count])
+    prog.update(len(domain_seq_dict))
+    print('Collected {:,} Training Sequences and {:,} Testing Sequences with {:,} Domains'.format(len(train_set), len(test_set), len(domain_list)))
+    # Collected 16711 Training Sequences and 16711 Testing Sequences with 16711 Domains
 
-            domain_regions_dict_cache_path = '{0}.json'.format(os.path.splitext(regions_path)[0])
-            if os.path.exists(domain_regions_dict_cache_path):
-                print('Loading {0}'.format(domain_regions_dict_cache_path))
-                with open(domain_regions_dict_cache_path, 'r') as f:
-                    domain_regions_dict = json.load(f)
-            else:
-                print('Building {0}'.format(domain_regions_dict_cache_path))
-                domain_regions_dict = _pfam_regions_tsv_gz_to_dict(regions_path)
-                with open(domain_regions_dict_cache_path, 'w') as f:
-                    json.dump(domain_regions_dict, f)
-                
-            print('seq_dict[{}]'.format(len(seq_dict))) # seq_dict[71201428]
-            print('domain_regions_dict[{}]'.format(len(domain_regions_dict))) # domain_regions_dict[16712]
+    domain_list.reverse() # popular domains first
+    domain_list = ['PAD', 'NO_DOMAIN', 'UNKNOWN_DOMAIN'] + domain_list
+    # build domain to id mapping
+    domain_index = dict([(d, i) for i, d in enumerate(domain_list)])
+    aa_index = dict(zip(aa_list, range(index_from, index_from + len(aa_list))))
 
-            domain_list = []
-            # build seq_regions_dict[seq_id] = [(pfamA_acc, seq_start, seq_end), ...]
-            seq_regions_dict = defaultdict(list)
-            # domains with the most sequences first
-            prog = tf.keras.utils.Progbar(num_domain or len(domain_regions_dict))
-            for i, pfamA_acc in enumerate(sorted(domain_regions_dict, key=lambda k: (len(domain_regions_dict[k]), k), reverse=True)):
-                prog.update(i)
-                domain_list.append(pfamA_acc)
-                for seq_id, seq_start, seq_end in domain_regions_dict[pfamA_acc]:
-                    seq_regions_dict[seq_id].append((pfamA_acc, seq_start, seq_end))
-                if num_domain and len(domain_list) >= num_domain:
-                    break
-            prog.update(num_domain or len(domain_regions_dict), force=True)
+    train_list = list(train_set)
+    np.random.shuffle(train_list)
+    test_list = list(test_set)
+    np.random.shuffle(test_list)
+    # build dataset
+    dataset = {
+        'train': {
+            'seq_ids': train_list,
+            'proteins': [],
+            'domains': []
+        },
+        'test': {
+            'seq_ids': test_list,
+            'proteins': [],
+            'domains': []
+        }
+    }
+    # build metadata
+    metadata = {
+        'train': {
+            'seq_count': {
+                'total': len(train_list),
+                'per_domain': {
+                    'min': 0,
+                    'median': 0,
+                    'max': 0
+                }
+            },
+            'seq_len': {
+                'total': 0,
+                'min': 0,
+                'median': 0,
+                'max': 0
+            }
+        },
+        'test': {
+            'seq_count': {
+                'total': len(train_list),
+                'per_domain': {
+                    'min': 0,
+                    'median': 0,
+                    'max': 0
+                }
+            },
+            'seq_len': {
+                'total': 0,
+                'min': 0,
+                'median': 0,
+                'max': 0
+            }
+        },
+        'aa_list': aa_list,
+        'aa_index': aa_index,
+        'domain_list': domain_list,
+        'domain_index': domain_index,
+        'domain_count': len(domain_list)
+    }
 
-            domain_list = ['PAD', 'NO_DOMAIN', 'UNKNOWN_DOMAIN'] + domain_list
-            # build domain to id mapping
-            domain_id = dict([(d, i) for i, d in enumerate(domain_list)])
+    # sequences = []
+    # domains = []
+    for k in dataset:
+        print('Generating Domain Sequence Representation for {} Dataset'.format(k.upper()))
+        prog = tf.keras.utils.Progbar(len(dataset[k]['seq_ids']))
+        domain_seq_count = defaultdict(set)
+        seq_len = []
+        for i, seq_id in enumerate(dataset[k]['seq_ids']):
+            prog.update(i)
+            seq_len.append(len(seq_dict[seq_id]))
+            try:
+                dataset[k]['proteins'].append(np.array([aa_index[a] for a in seq_dict[seq_id]], dtype=np.uint8))
+            except KeyError as e:
+                print('{0} parsing {1}: {2}'.format(e, seq_id, seq_dict[seq_id]))
+                raise e
+            # initialize domain with 'NO_DOMAIN'
+            domain = [domain_index['NO_DOMAIN']] * len(seq_dict[seq_id])
+            for pfamA_acc, seq_start, seq_end in seq_regions_dict[seq_id]:
+                domain_seq_count[pfamA_acc].add(seq_id)
+                domain = domain[:seq_start-1] + [domain_index[pfamA_acc]] * (seq_end - seq_start + 1) + domain[seq_end:]
+            dataset[k]['domains'].append(np.array(domain, dtype=np.uint16))
+        prog.update(len(dataset[k]['seq_ids']))
+        # record metadata
+        seq_count_per_domain = sorted([len(s) for s in domain_seq_count.values()])
+        metadata[k]['seq_count']['per_domain']['min'] = seq_count_per_domain[0]
+        metadata[k]['seq_count']['per_domain']['median'] = seq_count_per_domain[len(seq_count_per_domain)//2]
+        metadata[k]['seq_count']['per_domain']['max'] = seq_count_per_domain[-1]
+        seq_len = sorted(seq_len)
+        metadata[k]['seq_len']['total'] = sum(seq_len)
+        metadata[k]['seq_len']['min'] = seq_len[0]
+        metadata[k]['seq_len']['median'] = seq_len[len(seq_len)//2]
+        metadata[k]['seq_len']['max'] = seq_len[-1]
 
-            sequences = []
-            domains = []
-            aa_index = dict(zip(aa_list, range(index_from, index_from + len(aa_list))))
-            prog = tf.keras.utils.Progbar(len(seq_regions_dict))
-            for i, seq_id in enumerate(seq_regions_dict):
-                prog.update(i)
-                try:
-                    sequences.append(np.array([aa_index[a] for a in seq_dict[seq_id]], dtype=np.uint8))
-                except KeyError as e:
-                    print('{0} parsing {1}: {2}'.format(e, seq_id, seq_dict[seq_id]))
-                    raise e
-                # initialize domain with 'NO_DOMAIN'
-                domain = [domain_id['NO_DOMAIN']] * len(seq_dict[seq_id])
-                for pfamA_acc, seq_start, seq_end in seq_regions_dict[seq_id]:
-                    domain = domain[:seq_start-1] + [domain_id[pfamA_acc]] * (seq_end - seq_start + 1) + domain[seq_end:]
-                domains.append(np.array(domain, dtype=np.uint16))
-            prog.update(len(seq_regions_dict), force=True)
+    return dataset, metadata
 
             # save cache
             # print('Save sequence domain data...')
@@ -221,22 +364,22 @@ def load_data(uniprot_file='uniprot.gz',
             #     # ValueError Zip64 Limit 48GB
             #     print(e)
 
-        print('Shuffle data...')
-        np.random.seed(seed)
-        np.random.shuffle(domains)
-        np.random.seed(seed)
-        np.random.shuffle(sequences)
+        # print('Shuffle data...')
+        # np.random.seed(seed)
+        # np.random.shuffle(domains)
+        # np.random.seed(seed)
+        # np.random.shuffle(sequences)
 
-        print('Test split...')
-        x_train = np.array(sequences[:int(len(sequences) * (1 - test_split))])
-        y_train = np.array(domains[:int(len(sequences) * (1 - test_split))])
+        # print('Test split...')
+        # x_train = np.array(sequences[:int(len(sequences) * (1 - test_split))])
+        # y_train = np.array(domains[:int(len(sequences) * (1 - test_split))])
 
-        x_test = np.array(sequences[int(len(sequences) * (1 - test_split)):])
-        y_test = np.array(domains[int(len(sequences) * (1 - test_split)):])
+        # x_test = np.array(sequences[int(len(sequences) * (1 - test_split)):])
+        # y_test = np.array(domains[int(len(sequences) * (1 - test_split)):])
 
-        print('Get max length...')
-        maxlen_train = max([len(x) for x in x_train])
-        maxlen_test = max([len(x) for x in x_test])
+        # print('Get max length...')
+        # maxlen_train = max([len(x) for x in x_train])
+        # maxlen_test = max([len(x) for x in x_test])
 
         # save cache
         # print('Save split data...')
@@ -248,26 +391,26 @@ def load_data(uniprot_file='uniprot.gz',
         #     # ValueError Zip64 Limit 48GB
         #     print(e)
 
-    print(len(x_train), 'train sequences') # 3442895 train sequences
-    print(len(x_test), 'test sequences') # 860724 test sequences
-    # print(domain_list)
-    num_classes = len(domain_list)
-    print(num_classes, 'classes') # 13 classes
-    print('maxlen_train:', maxlen_train) # d10: 25572
-    print('maxlen_test:', maxlen_test) # d10: 22244
+    # print(len(x_train), 'train sequences') # 3442895 train sequences
+    # print(len(x_test), 'test sequences') # 860724 test sequences
+    # # print(domain_list)
+    # num_classes = len(domain_list)
+    # print(num_classes, 'classes') # 13 classes
+    # print('maxlen_train:', maxlen_train) # d10: 25572
+    # print('maxlen_test:', maxlen_test) # d10: 22244
 
-    return (x_train, y_train, maxlen_train), (x_test, y_test, maxlen_test), domain_list
+    # return (x_train, y_train, maxlen_train), (x_test, y_test, maxlen_test), domain_list
 
-def save_to_tfrecord(x, y, path):
-    """Saves x and y to tfrecord file.
+def save_to_tfrecord(data, path):
+    """Saves data to tfrecord file.
     """
     print('Writing {}'.format(path))
     with tf.python_io.TFRecordWriter(path) as writer:
-        prog = tf.keras.utils.Progbar(len(x))
-        for index in range(len(x)):
+        prog = tf.keras.utils.Progbar(len(data['seq_ids']))
+        for index in range(len(data['seq_ids'])):
             prog.update(index)
-            protein = x[index].astype(np.uint8)
-            domains = y[index].astype(np.uint16)
+            protein = data['proteins'][index].astype(np.uint8)
+            domains = data['domains'][index].astype(np.uint16)
             example = tf.train.SequenceExample(
                 feature_lists=tf.train.FeatureLists(
                     feature_list={
@@ -285,7 +428,7 @@ def save_to_tfrecord(x, y, path):
                 )
             )
             writer.write(example.SerializeToString())
-        prog.update(len(x), force=True)
+        prog.update(len(data['seq_ids']))
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -294,6 +437,8 @@ if __name__ == "__main__":
         help='Include only the top N domain classes in the dataset file, include all domain classes if None.')
     parser.add_argument('-s', '--test_split', type=float, default=0.2,
         help='Fraction of the dataset to be used as test data.')
+    parser.add_argument('-p', '--max_seq_per_class', type=int, default=None,
+        help='Limit the number of sequences to include in the training and testing datasets.')
     parser.add_argument('-c', '--cache_root', type=str, default=os.path.join(os.path.expanduser('~'), '.keras'),
         help="Location to store cached files, defaults to '~/.keras'.")
     parser.add_argument('-d', '--cache_dir', type=str, default='datasets',
@@ -304,15 +449,75 @@ if __name__ == "__main__":
     print(args)
 
     print('Loading data...')
-    (x_train, y_train_class, maxlen_train), (x_test, y_test_class, maxlen_test), domain_list = load_data(
-        num_domain=args.num_classes, test_split=args.test_split, 
+    # (x_train, y_train_class, maxlen_train), (x_test, y_test_class, maxlen_test), domain_list = load_data(
+    dataset, metadata = load_data(
+        num_domain=args.num_classes, test_split=args.test_split, max_seq_per_class=args.max_seq_per_class,
         cache_dir=args.cache_root, cache_subdir=args.cache_dir)
-
-    # convert to tfrecords
-    train_path = os.path.join(args.cache_root, args.cache_dir, 
-        'pfam-regions-d{}-s{}-{}.tfrecords'.format(args.num_classes or 0, int(args.test_split * 100), 'train'))
-    save_to_tfrecord(x_train, y_train_class, train_path)
-    test_path = os.path.join(args.cache_root, args.cache_dir, 
-        'pfam-regions-d{}-s{}-{}.tfrecords'.format(args.num_classes or 0, int(args.test_split * 100), 'test'))
-    save_to_tfrecord(x_test, y_test_class, test_path)
     
+    file_prefix = 'pfam-regions-d{}-s{}'.format(args.num_classes or 0, int(args.test_split * 100))
+    if args.max_seq_per_class:
+        file_prefix = '{}-p{}'.format(file_prefix, args.max_seq_per_class)
+    
+    meta_f = Path(args.cache_root, args.cache_dir, '{}-meta.json'.format(file_prefix))
+    meta_f.parent.mkdir(parents=True, exist_ok=True)
+    meta_f.write_text(ujson.dumps(metadata, indent=2, sort_keys=False))
+
+    for k in dataset:
+        save_to_tfrecord(dataset[k], os.path.join(args.cache_root, args.cache_dir,
+            '{}-{}.tfrecords'.format(file_prefix, k)))
+    # train_prefix = '{}-{}'.format(file_prefix, 'train')
+    # test_prefix = '{}-{}'.format(file_prefix, 'test')
+    ## meta.json
+    # sequence_count
+    #   total
+    #   max
+    #   min
+    #   median
+    # sequence_length
+    #   total
+    #   max
+    #   min
+    #   median
+    ## domain.csv
+    # domain,sequence_count,sequence_length
+    # train_meta_f = Path(args.cache_root, args.cache_dir, '{}.json'.format(train_prefix))
+    # train_meta_f.parent.mkdir(parents=True, exist_ok=True)
+    # train_meta_f.write_text(ujson.dumps({
+    #     'number_of_records': len(y_train_class),
+    #     'max_record_length': maxlen_train
+    # }, indent=2, sort_keys=False))
+    # test_meta_f = Path(args.cache_root, args.cache_dir, '{}.json'.format(test_prefix))
+    # test_meta_f.write_text(ujson.dumps({
+    #     'number_of_records': len(y_test_class),
+    #     'max_record_length': maxlen_test
+    # }, indent=2, sort_keys=False))
+
+    # # convert to tfrecords
+    # train_path = os.path.join(args.cache_root, args.cache_dir, 
+    #     'pfam-regions-d{}-s{}-{}.tfrecords'.format(args.num_classes or 0, int(args.test_split * 100), 'train'))
+    # save_to_tfrecord(x_train, y_train_class, train_path)
+    # test_path = os.path.join(args.cache_root, args.cache_dir, 
+    #     'pfam-regions-d{}-s{}-{}.tfrecords'.format(args.num_classes or 0, int(args.test_split * 100), 'test'))
+    # save_to_tfrecord(x_test, y_test_class, test_path)
+    
+    # d0
+    # 43,378,794 train sequences (??? bases)
+    # 10,844,699 test sequences
+    # 16,715 classes
+    # maxlen_train: 36,507
+    # maxlen_test: 34,350
+    # pfam-regions-d0-s20-train.tfrecords
+    ## MD5: 1E63566F7CCB5D9207DE8839ABC8A4C2
+    # pfam-regions-d0-s20-test.tfrecords
+    ## MD5: CB78507F2D2C3A3E7A3171901B2AC3CB
+    # pfam-regions-d10-s20-train.tfrecords
+    ## MD5: 009C907D5F4576B33C22C59F52531459
+    # pfam-regions-d10-s20-test.tfrecords
+    ## MD5: 99764A11E4BC86CD162242E08C968FE9
+
+    # Make a toy dataset that can finish in 150 steps (60 sec)  - 1 sequence/class
+    # python .\util\make_dataset_pfam_regions.py -p 1 -c D:/ -d datasets2
+    # Make a toy dataset that can finish in 300 steps (120 sec) - 2 sequence/class
+    # python .\util\make_dataset_pfam_regions.py -p 2 -c D:/ -d datasets2
+    # Make a toy dataset that can finish in 750 steps (300 sec) - 3 sequence/class
+    # python .\util\make_dataset_pfam_regions.py -p 3 -c D:/ -d datasets2
