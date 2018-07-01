@@ -332,7 +332,7 @@ def load_data(uniprot_file='uniprot.gz',
         },
         'test': {
             'seq_count': {
-                'total': len(train_list),
+                'total': len(test_list),
                 'per_domain': {
                     'min': 0,
                     'median': 0,
