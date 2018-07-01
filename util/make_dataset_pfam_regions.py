@@ -257,7 +257,7 @@ def load_data(uniprot_file='uniprot.gz',
         seq_list = list(all_seq_set - test_set - train_set)
         # assert counts
         if test_count < 0 or train_count < 0:
-            print('ERROR: {}={}, seq_count={}, test_count={}, train_count={}, already in test_set= {}, already in train_set= {}'.format(
+            print('\n WARNING: {}={}, seq_count={}, test_count={}, train_count={}, already in test_set= {}, already in train_set= {}'.format(
                 i, pfamA_acc, seq_count, test_count, train_count, len(test_set & all_seq_set), len(train_set & all_seq_set)
             ))
             test_count = max(0, test_count)
