@@ -776,6 +776,7 @@ class EpochCheckpointSaverHook(tf.train.CheckpointSaverHook):
 
     def __init__(self,
                 checkpoint_dir,
+                epoch_tensor=None,
                 save_secs=None,
                 save_steps=None,
                 saver=None,
@@ -835,6 +836,7 @@ class EpochCheckpointSaverHook(tf.train.CheckpointSaverHook):
         self._step_listeners = step_listeners or []
         self._epoch_saver = epoch_saver
         self._steps_per_run = 1
+        self._epoch_tensor = epoch_tensor
 
     def _set_steps_per_run(self, steps_per_run):
         self._steps_per_run = steps_per_run
@@ -853,6 +855,13 @@ class EpochCheckpointSaverHook(tf.train.CheckpointSaverHook):
         if self._global_step_tensor is None:
             raise RuntimeError(
                 "Global step should be created to use EpochCheckpointSaverHook.")
+        if self._epoch_tensor is None:
+            self._epoch_tensor = tf.get_variable(
+                name='epoch',
+                shape=[],
+                dtype=tf.int64,
+                initializer=tf.zeros_initializer(),
+                trainable=False)
                 
         if self._epoch_saver is None:
             self._epoch_saver = tf.train.Saver(
@@ -862,6 +871,9 @@ class EpochCheckpointSaverHook(tf.train.CheckpointSaverHook):
                 defer_build=False,
                 save_relative_paths=True
             )
+
+        self._increment_epoch = tf.assign_add(self._epoch_tensor, 1, 
+            use_locking=True, name='increment_epoch')
 
         for l in self._epoch_listeners:
             l.begin()
@@ -976,29 +988,33 @@ class EpochCheckpointSaverHook(tf.train.CheckpointSaverHook):
         # print('SAVEABLE_OBJECTS after', len(savables_ref), savables_ref)
 
         last_step = session.run(self._global_step_tensor)
-        
-        if last_step != self._timer.last_triggered_step():
-            self._save_step(session, last_step)
-        
-        self._save_epoch(session, last_step)
-        
-        for l in self._epoch_listeners:
-            # _NewCheckpointListenerForEvaluate will run here at end
-            l.end(session, last_step)
-        
-        for l in self._step_listeners:
-            l.end(session, last_step)
+        epoch = session.run(self._increment_epoch)
 
-    def _save_epoch(self, session, step):
+        with tf.control_dependencies([self._increment_epoch]):
+            if last_step != self._timer.last_triggered_step():
+                self._save_step(session, last_step)
+            
+            self._save_epoch(session, last_step, epoch)
+            
+            for l in self._epoch_listeners:
+                # _NewCheckpointListenerForEvaluate will run here at end
+                l.end(session, last_step)
+            
+            for l in self._step_listeners:
+                l.end(session, last_step)
+
+
+    def _save_epoch(self, session, step, epoch):
         """Saves the latest checkpoint, returns should_stop."""
-        tf.logging.info("Saving\033[1;31m epoch\033[0m checkpoints for %d into %s.", step, self._epoch_save_path)
+        save_path = '{}-{}'.format(self._epoch_save_path, epoch)
+        tf.logging.info("Saving\033[1;31m epoch\033[0m checkpoints for %d into %s.", step, save_path)
 
         for l in self._epoch_listeners:
             l.before_save(session, step)
 
         self._get_epoch_saver().save(
             sess=session, 
-            save_path=self._epoch_save_path, 
+            save_path=save_path, 
             global_step=step,
             latest_filename=self._epoch_latest_filename,
             meta_graph_suffix="meta",
@@ -1175,6 +1191,13 @@ def model_fn(features, labels, mode, params, config):
     lengths = features['lengths']
     # lengths shape=(batch_size, ), dtype=int32
     global_step = tf.train.get_global_step()
+    # global_step is assign_add 1 in tf.train.Optimizer.apply_gradients
+    epoch = tf.get_variable(
+        name='epoch',
+        shape=[],
+        dtype=tf.int64,
+        initializer=tf.zeros_initializer(),
+        trainable=False)
     batch_size = tf.shape(lengths)[0]
 
     if params.use_tensor_ops:
@@ -1490,6 +1513,7 @@ def model_fn(features, labels, mode, params, config):
         pass
     training_hooks.append(tf.train.LoggingTensorHook(
         tensors={
+            'epoch': epoch,
             'accuracy': batch_accuracy,
             'loss': loss,
             'step': global_step,
@@ -1555,6 +1579,7 @@ def model_fn(features, labels, mode, params, config):
     # ))
     training_chief_hooks.append(EpochCheckpointSaverHook(
         checkpoint_dir=params.model_dir,
+        epoch_tensor=epoch,
         save_secs=params.save_checkpoints_secs, # 10m
         save_steps=None,
         scaffold=scaffold
@@ -2018,6 +2043,12 @@ if __name__ == '__main__':
         # default='D:/datasets/pfam-regions-d0-s20/pfam-regions-d0-s20-test.tfrecords',
         default='D:/datasets/pfam-regions-d10-s20-test.tfrecords',
         help='Path to evaluation data (tf.Example in TFRecord format)')
+    parser.add_argument(
+        '--meta_data',
+        type=str,
+        # default='D:/datasets/pfam-regions-d0-s20/pfam-regions-d0-s20-test.tfrecords',
+        default='',
+        help='Path to metadata.json generated by prep_dataset)')
     parser.add_argument(
         '--num_classes',
         type=int,
