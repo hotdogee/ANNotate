@@ -24,6 +24,7 @@ import os
 import sys
 import ast
 import glob
+import json
 import argparse
 import datetime
 import functools
@@ -855,13 +856,6 @@ class EpochCheckpointSaverHook(tf.train.CheckpointSaverHook):
         if self._global_step_tensor is None:
             raise RuntimeError(
                 "Global step should be created to use EpochCheckpointSaverHook.")
-        if self._epoch_tensor is None:
-            self._epoch_tensor = tf.get_variable(
-                name='epoch',
-                shape=[],
-                dtype=tf.int64,
-                initializer=tf.zeros_initializer(),
-                trainable=False)
                 
         if self._epoch_saver is None:
             self._epoch_saver = tf.train.Saver(
@@ -871,9 +865,6 @@ class EpochCheckpointSaverHook(tf.train.CheckpointSaverHook):
                 defer_build=False,
                 save_relative_paths=True
             )
-
-        self._increment_epoch = tf.assign_add(self._epoch_tensor, 1, 
-            use_locking=True, name='increment_epoch')
 
         for l in self._epoch_listeners:
             l.begin()
@@ -988,25 +979,29 @@ class EpochCheckpointSaverHook(tf.train.CheckpointSaverHook):
         # print('SAVEABLE_OBJECTS after', len(savables_ref), savables_ref)
 
         last_step = session.run(self._global_step_tensor)
-        epoch = session.run(self._increment_epoch)
+        epoch = None
+        if self._epoch_tensor is not None:
+            epoch = session.run(self._epoch_tensor)
 
-        with tf.control_dependencies([self._increment_epoch]):
-            if last_step != self._timer.last_triggered_step():
-                self._save_step(session, last_step)
-            
-            self._save_epoch(session, last_step, epoch)
-            
-            for l in self._epoch_listeners:
-                # _NewCheckpointListenerForEvaluate will run here at end
-                l.end(session, last_step)
-            
-            for l in self._step_listeners:
-                l.end(session, last_step)
+        if last_step != self._timer.last_triggered_step():
+            self._save_step(session, last_step)
+        
+        self._save_epoch(session, last_step, epoch)
+        
+        for l in self._epoch_listeners:
+            # _NewCheckpointListenerForEvaluate will run here at end
+            l.end(session, last_step)
+        
+        for l in self._step_listeners:
+            l.end(session, last_step)
 
 
     def _save_epoch(self, session, step, epoch):
         """Saves the latest checkpoint, returns should_stop."""
-        save_path = '{}-{}'.format(self._epoch_save_path, epoch)
+        if epoch:
+            save_path = '{}-{}'.format(self._epoch_save_path, epoch)
+        else:
+            save_path = self._epoch_save_path
         tf.logging.info("Saving\033[1;31m epoch\033[0m checkpoints for %d into %s.", step, save_path)
 
         for l in self._epoch_listeners:
@@ -1192,13 +1187,13 @@ def model_fn(features, labels, mode, params, config):
     # lengths shape=(batch_size, ), dtype=int32
     global_step = tf.train.get_global_step()
     # global_step is assign_add 1 in tf.train.Optimizer.apply_gradients
-    epoch = tf.get_variable(
-        name='epoch',
-        shape=[],
-        dtype=tf.int64,
-        initializer=tf.zeros_initializer(),
-        trainable=False)
     batch_size = tf.shape(lengths)[0]
+    # number of sequences per epoch
+    seq_total = batch_size
+    if mode == tf.estimator.ModeKeys.TRAIN:
+        seq_total = params.metadata['train']['seq_count']['total']
+    elif mode == tf.estimator.ModeKeys.EVAL:
+        seq_total = params.metadata['test']['seq_count']['total']
 
     if params.use_tensor_ops:
         float_type = tf.float16
@@ -1483,7 +1478,11 @@ def model_fn(features, labels, mode, params, config):
         0, trainable=False, name='examples_processed')
     group_inputs.append(tf.assign_add(examples_processed,
                                       batch_size, name='update_examples_processed'))
-
+    epoch = examples_processed // seq_total
+    group_inputs.append(epoch)
+    progress = examples_processed / seq_total - tf.cast(epoch, tf.float64)
+    group_inputs.append(progress)
+    
     train_op = tf.group(*group_inputs)
 
     if params.debug:
@@ -1511,15 +1510,20 @@ def model_fn(features, labels, mode, params, config):
     # INFO:tensorflow:accuracy = 0.16705106, examples = 15000, loss = 9.688441, step = 150 (24.091 sec)
     def logging_formatter(tensor_values):
         pass
+
+    tensors = {
+        'accuracy': batch_accuracy,
+        'loss': loss,
+        'step': global_step,
+        'input_size': tf.shape(protein),
+        'examples': examples_processed
+    }
+    if is_train:
+        tensors['epoch'] = epoch
+        tensors['progress'] = progress
+        
     training_hooks.append(tf.train.LoggingTensorHook(
-        tensors={
-            'epoch': epoch,
-            'accuracy': batch_accuracy,
-            'loss': loss,
-            'step': global_step,
-            'input_size': tf.shape(protein),
-            'examples': examples_processed
-        },
+        tensors=tensors,
         every_n_iter=params.log_step_count_steps,
         at_end=False, formatter=None
     ))
@@ -1617,6 +1621,12 @@ def model_fn(features, labels, mode, params, config):
 
 def create_estimator_and_specs(run_config):
     """Creates an Estimator, TrainSpec and EvalSpec."""
+    # parse metadata
+    metadata = None
+    with open(FLAGS.metadata_path) as f:
+        metadata = json.load(f)
+    
+    # build hyperparameters
     model_params = tf.contrib.training.HParams(
         job=FLAGS.job,
         model_dir=FLAGS.model_dir,
@@ -1674,13 +1684,15 @@ def create_estimator_and_specs(run_config):
 
         check_nans=FLAGS.check_nans,
         trace=FLAGS.trace,
-        debug=FLAGS.debug
+        debug=FLAGS.debug,
         # num_layers=FLAGS.num_layers,
         # num_conv=ast.literal_eval(FLAGS.num_conv),
         # conv_len=ast.literal_eval(FLAGS.conv_len),
         # gradient_clipping_norm=FLAGS.gradient_clipping_norm,
         # cell_type=FLAGS.cell_type,
         # batch_norm=FLAGS.batch_norm
+        metadata_path=FLAGS.metadata_path,
+        metadata=metadata
     )
 
     # hook = tf_debug.LocalCLIDebugHook()
@@ -1751,7 +1763,11 @@ def main(unused_args):
         msg = 'No evaluation data files found for pattern: {}'.format(FLAGS.eval_data)
         tf.logging.fatal(msg)
         raise IOError(msg)
-    
+    if len(glob.glob(FLAGS.metadata_path)) == 0:
+        msg = 'No metadata file found for pattern: {}'.format(FLAGS.metadata_path)
+        tf.logging.fatal(msg)
+        raise IOError(msg)
+
     # Hardware info
     FLAGS.num_gpus = FLAGS.num_gpus or tf.contrib.eager.num_gpus()
     FLAGS.num_cpu_threads = FLAGS.num_cpu_threads or os.cpu_count()
@@ -1982,6 +1998,7 @@ def main(unused_args):
 # 
 # $Env:CUDA_VISIBLE_DEVICES=0; python main.py --training_data=D:/datasets2/pfam-regions-d4000-s20-t1-e1-train.tfrecords --eval_data=D:/datasets2/pfam-regions-d4000-s20-t1-e1-test.tfrecords --num_classes=4003 --batch_size=2 --save_summary_steps=50 --log_step_count_steps=5 --decay_steps=10000 --learning_rate=0.0001 --adam_epsilon=0.02 --save_checkpoints_secs=3 --keep_checkpoint_max=2 --model_dir=D:/checkpoints/pfam-regions-d4000-s20-t1-e1/1950x-TITANV/b2-lr0.0001-2
 #
+# $Env:CUDA_VISIBLE_DEVICES=0; python main.py --training_data=D:/datasets2/pfam-regions-d4000-s20-t1-e1-train.tfrecords --eval_data=D:/datasets2/pfam-regions-d4000-s20-t1-e1-test.tfrecords --metadata_path=D:/datasets2/pfam-regions-d4000-s20-t1-e1-meta.json --num_classes=4003 --batch_size=2 --save_summary_steps=50 --log_step_count_steps=5 --decay_steps=10000 --learning_rate=0.0001 --adam_epsilon=0.02 --save_checkpoints_secs=3 --keep_checkpoint_max=2 --model_dir=D:/checkpoints/pfam-regions-d4000-s20-t1-e1/1950x-TITANV/b2-lr0.0001-1
 
 
 # sequence count = 54,223,493, train = 43,378,794, test = 10,844,699
@@ -2044,7 +2061,7 @@ if __name__ == '__main__':
         default='D:/datasets/pfam-regions-d10-s20-test.tfrecords',
         help='Path to evaluation data (tf.Example in TFRecord format)')
     parser.add_argument(
-        '--meta_data',
+        '--metadata_path',
         type=str,
         # default='D:/datasets/pfam-regions-d0-s20/pfam-regions-d0-s20-test.tfrecords',
         default='',
