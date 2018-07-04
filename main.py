@@ -20,24 +20,52 @@ When running on GPUs using --cell_type cudnn_lstm is much faster.
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
-import argparse
-import ast
-import functools
-import datetime
-import sys
 import os
+import sys
+import ast
+import glob
+import argparse
+import datetime
+import functools
 from pathlib import Path
 
 import tensorflow as tf
+from tensorflow.python.ops import variables
+from tensorflow.python.data.ops import iterator_ops
+from tensorflow.contrib.data.python.ops.iterator_ops import _Saveable, _CustomSaver
+from tensorflow.core.util.event_pb2 import SessionLog
+from tensorflow.python.training import training_util
+from tensorflow.python.framework import meta_graph
 from tensorflow.python.data.util import nest
 from tensorflow.contrib.layers.python.layers import adaptive_clipping_fn
 from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python import debug as tf_debug
+from tensorflow.python.platform import tf_logging as logging
 import numpy as np
+from colorama import init, Fore, Back, Style
+import coloredlogs
 
 # Disable cpp warnings
 # os.environ['TF_CPP_MIN_LOG_LEVEL']='2'
 # Show debugging output, default: tf.logging.INFO
+logger = logging._get_logger()
+coloredlogs.DEFAULT_FIELD_STYLES = dict(
+    asctime=dict(color='green'),
+    hostname=dict(color='magenta'),
+    levelname=dict(color='black', bold=True),
+    programname=dict(color='cyan'),
+    name=dict(color='blue'))
+coloredlogs.DEFAULT_LEVEL_STYLES = dict(
+    spam=dict(color='green', faint=True),
+    debug=dict(color='green'),
+    verbose=dict(color='blue'),
+    info=dict(),
+    notice=dict(color='magenta'),
+    warning=dict(color='yellow'),
+    success=dict(color='green', bold=True),
+    error=dict(color='red'),
+    critical=dict(color='red', bold=True))
+coloredlogs.install(level='DEBUG', logger=logger, milliseconds=True)
 tf.logging.set_verbosity(tf.logging.DEBUG)
 
 FLAGS = None
@@ -370,16 +398,491 @@ def input_fn(mode, params, config):
         # A `tf.int64` scalar `tf.Tensor`, representing the
         # maximum number batches that will be buffered when prefetching.
     )
-
     return dataset
 
+    # iterator = dataset.make_one_shot_iterator()
 
-class CheckpointSaverHook(tf.train.CheckpointSaverHook):
-    """Saves checkpoints every N steps or seconds.
+    # if mode == tf.estimator.ModeKeys.TRAIN:
+    #     # Build the iterator SaveableObject.
+    #     saveable_obj = tf.contrib.data.make_saveable_from_iterator(iterator)
+    #     # Add the SaveableObject to the SAVEABLE_OBJECTS collection so
+    #     # it can be automatically saved using Saver.
+    #     tf.add_to_collection(tf.GraphKeys.SAVEABLE_OBJECTS, saveable_obj)
+    # tf.logging.debug('input_fn called')
+    # return iterator.get_next()
+class EpochCheckpointInputPipelineHookSaver(tf.train.Saver):
+  """`Saver` with a different default `latest_filename`.
+
+  This is used in the `CheckpointInputPipelineHook` to avoid conflicts with
+  the model ckpt saved by the `CheckpointSaverHook`.
+  """
+
+  def __init__(self, 
+               var_list, 
+               latest_filename,
+               sharded=False,
+               max_to_keep=5,
+               keep_checkpoint_every_n_hours=10000.0,
+               defer_build=False,
+               save_relative_paths=True):
+    super(EpochCheckpointInputPipelineHookSaver, self).__init__(
+        var_list,
+        sharded=sharded,
+        max_to_keep=max_to_keep,
+        keep_checkpoint_every_n_hours=keep_checkpoint_every_n_hours,
+        defer_build=defer_build,
+        save_relative_paths=save_relative_paths
+    )
+    self._latest_filename = latest_filename
+
+  def save(self,
+           sess,
+           save_path,
+           global_step=None,
+           latest_filename=None,
+           meta_graph_suffix="meta",
+           write_meta_graph=True,
+           write_state=True,
+           strip_default_attrs=False):
+    return super(EpochCheckpointInputPipelineHookSaver, self).save(
+        sess, save_path, global_step, latest_filename or self._latest_filename,
+        meta_graph_suffix, write_meta_graph, write_state, strip_default_attrs)
+
+class EpochCheckpointInputPipelineHook(tf.train.SessionRunHook):
+    """Checkpoints input pipeline state every N steps or seconds.
+
+    This hook saves the state of the iterators in the `Graph` so that when
+    training is resumed the input pipeline continues from where it left off.
+    This could potentially avoid overfitting in certain pipelines where the
+    number of training steps per eval are small compared to the dataset
+    size or if the training pipeline is pre-empted.
+
+    Differences from `CheckpointSaverHook`:
+    1. Saves only the input pipelines in the "iterators" collection and not the
+       global variables or other saveable objects.
+    2. Does not write the `GraphDef` and `MetaGraphDef` to the summary.
+
+    Example of checkpointing the training pipeline:
+
+    ```python
+    est = tf.estimator.Estimator(model_fn)
+    while True:
+      est.train(
+          train_input_fn,
+          hooks=[tf.contrib.data.CheckpointInputPipelineHook(est)],
+          steps=train_steps_per_eval)
+      # Note: We do not pass the hook here.
+      metrics = est.evaluate(eval_input_fn)
+      if should_stop_the_training(metrics):
+        break
+    ```
+
+    This hook should be used if the input pipeline state needs to be saved
+    separate from the model checkpoint. Doing so may be useful for a few reasons:
+    1. The input pipeline checkpoint may be large, if there are large shuffle
+       or prefetch buffers for instance, and may bloat the checkpoint size.
+    2. If the input pipeline is shared between training and validation, restoring
+       the checkpoint during validation may override the validation input
+       pipeline.
+
+    For saving the input pipeline checkpoint alongside the model weights use
+    @{tf.contrib.data.make_saveable_from_iterator} directly to create a
+    `SaveableObject` and add to the `SAVEABLE_OBJECTS` collection. Note, however,
+    that you will need to be careful not to restore the training iterator during
+    eval. You can do that by not adding the iterator to the SAVEABLE_OBJECTS
+    collector when building the eval graph.
+    """
+
+    def __init__(self,
+                checkpoint_dir,
+                config,
+                save_secs=None,
+                save_steps=None,
+                checkpoint_basename="input",
+                listeners=None, 
+                defer_build=False,
+                save_relative_paths=True):
+        """Initializes a `EpochCheckpointInputPipelineHook`.
+        Creates a custom EpochCheckpointInputPipelineHookSaver
+
+        Args:
+            checkpoint_dir: `str`, base directory for the checkpoint files.
+            save_secs: `int`, save every N secs.
+            save_steps: `int`, save every N steps.
+            checkpoint_basename: `str`, base name for the checkpoint files.
+            listeners: List of `CheckpointSaverListener` subclass instances.
+                Used for callbacks that run immediately before or after this hook saves
+                the checkpoint.
+            config: tf.estimator.RunConfig.
+
+        Raises:
+            ValueError: One of `save_steps` or `save_secs` should be set.
+            ValueError: At most one of saver or scaffold should be set.
+        """
+        # `checkpoint_basename` is "input.ckpt" for non-distributed pipelines or
+        # of the form "input_<task_type>_<task_id>.ckpt" for distributed pipelines.
+        # Note: The default `checkpoint_basename` used by `CheckpointSaverHook` is
+        # "model.ckpt". We intentionally choose the input pipeline checkpoint prefix
+        # to be different to avoid conflicts with the model checkpoint.
+
+        # pylint: disable=protected-access
+        tf.logging.info("Create EpochCheckpointInputPipelineHook.")
+        self._checkpoint_dir = checkpoint_dir
+        self._config = config
+        self._defer_build = defer_build
+        self._save_relative_paths = save_relative_paths
+
+        self._checkpoint_prefix = checkpoint_basename
+        if self._config.num_worker_replicas > 1:
+            # Distributed setting.
+            suffix = "_{}_{}".format(self._config.task_type,
+                                     self._config.task_id)
+            self._checkpoint_prefix += suffix
+        # pylint: enable=protected-access
+
+        # We use a composition paradigm instead of inheriting from
+        # `CheckpointSaverHook` because `Estimator` does an `isinstance` check
+        # to check whether a `CheckpointSaverHook` is already present in the list
+        # of hooks and if not, adds one. Inheriting from `CheckpointSaverHook`
+        # would thwart this behavior. This hook checkpoints *only the iterators*
+        # and not the graph variables.
+        self._save_path = os.path.join(checkpoint_dir, checkpoint_basename)
+        self._timer = tf.train.SecondOrStepTimer(every_secs=save_secs,
+                                        every_steps=save_steps)
+        self._listeners = listeners or []
+        self._steps_per_run = 1
+
+        # Name for the protocol buffer file that will contain the list of most
+        # recent checkpoints stored as a `CheckpointState` protocol buffer.
+        # This file, kept in the same directory as the checkpoint files, is
+        # automatically managed by the `Saver` to keep track of recent checkpoints.
+        # The default name used by the `Saver` for this file is "checkpoint". Here
+        # we use the name "checkpoint_<checkpoint_prefix>" so that in case the
+        # `checkpoint_dir` is the same as the model checkpoint directory, there are
+        # no conflicts during restore.
+        self._latest_filename = self._checkpoint_prefix + '.latest'
+        self._first_run = True
+
+    def _set_steps_per_run(self, steps_per_run):
+        self._steps_per_run = steps_per_run
+
+    def begin(self):
+        """Called once before using the session.
+
+        When called, the default graph is the one that will be launched in the
+        session.  The hook can modify the graph by adding new operations to it.
+        After the `begin()` call the graph will be finalized and the other callbacks
+        can not modify the graph anymore. Second call of `begin()` on the same
+        graph, should not change the graph.
+        """
+        # Build a Saver that saves all iterators in the `GLOBAL_ITERATORS`
+        # collection 
+        iterators = tf.get_collection(iterator_ops.GLOBAL_ITERATORS)
+        saveables = [_Saveable(i) for i in iterators]
+        self._saver = EpochCheckpointInputPipelineHookSaver(
+            saveables,
+            self._latest_filename,
+            sharded=False,
+            max_to_keep=self._config.keep_checkpoint_max,
+            keep_checkpoint_every_n_hours=self._config.keep_checkpoint_every_n_hours,
+            defer_build=self._defer_build,
+            save_relative_paths=self._save_relative_paths
+        )
+            
+        self._summary_writer = tf.summary.FileWriterCache.get(self._checkpoint_dir)
+        self._global_step_tensor = training_util._get_or_create_global_step_read()  # pylint: disable=protected-access
+        if self._global_step_tensor is None:
+            raise RuntimeError(
+                "Global step should be created to use EpochCheckpointInputPipelineHook.")
+        for l in self._listeners:
+            l.begin()
+
+    def after_create_session(self, session, coord):
+        """Called when new TensorFlow session is created.
+
+        This is called to signal the hooks that a new session has been created. This
+        has two essential differences with the situation in which `begin` is called:
+
+        * When this is called, the graph is finalized and ops can no longer be added
+            to the graph.
+        * This method will also be called as a result of recovering a wrapped
+            session, not only at the beginning of the overall session.
+
+        Args:
+        session: A TensorFlow Session that has been created.
+        coord: A Coordinator object which keeps track of all threads.
+        """
+        global_step = session.run(self._global_step_tensor)
+        self._timer.update_last_triggered_step(global_step)
+        
+    def _maybe_restore_input_ckpt(self, session):
+        # Ideally this should be run in after_create_session but is not for the
+        # following reason:
+        # Currently there is no way of enforcing an order of running the
+        # `SessionRunHooks`. Hence it is possible that the `_DatasetInitializerHook`
+        # is run *after* this hook. That is troublesome because
+        # 1. If a checkpoint exists and this hook restores it, the initializer hook
+        #    will override it.
+        # 2. If no checkpoint exists, this hook will try to save an initialized
+        #    iterator which will result in an exception.
+        #
+        # As a temporary fix we enter the following implicit contract between this
+        # hook and the _DatasetInitializerHook.
+        # 1. The _DatasetInitializerHook initializes the iterator in the call to
+        #    after_create_session.
+        # 2. This hook saves the iterator on the first call to `before_run()`, which
+        #    is guaranteed to happen after `after_create_session()` of all hooks
+        #    have been run.
+
+        # Check if there is an existing checkpoint. If so, restore from it.
+        # pylint: disable=protected-access
+        latest_checkpoint_path = tf.train.latest_checkpoint(
+            self._checkpoint_dir,
+            latest_filename=self._latest_filename)
+        if latest_checkpoint_path:
+            self._get_saver().restore(session, latest_checkpoint_path)
+
+    def before_run(self, run_context):
+        """Called before each call to run().
+
+        You can return from this call a `SessionRunArgs` object indicating ops or
+        tensors to add to the upcoming `run()` call.  These ops/tensors will be run
+        together with the ops/tensors originally passed to the original run() call.
+        The run args you return can also contain feeds to be added to the run()
+        call.
+
+        The `run_context` argument is a `SessionRunContext` that provides
+        information about the upcoming `run()` call: the originally requested
+        op/tensors, the TensorFlow Session.
+
+        At this point graph is finalized and you can not add ops.
+
+        Args:
+        run_context: A `SessionRunContext` object.
+
+        Returns:
+        None or a `SessionRunArgs` object.
+        """
+        if self._first_run:
+            self._maybe_restore_input_ckpt(run_context.session)
+            self._first_run = False
+        return tf.train.SessionRunArgs(self._global_step_tensor)
+
+    def after_run(self, run_context, run_values):
+        stale_global_step = run_values.results
+        if self._timer.should_trigger_for_step(stale_global_step + self._steps_per_run):
+            # get the real value after train op.
+            global_step = run_context.session.run(self._global_step_tensor)
+            if self._timer.should_trigger_for_step(global_step):
+                self._timer.update_last_triggered_step(global_step)
+                if self._save(run_context.session, global_step):
+                    run_context.request_stop()
+
+    def end(self, session):
+        """Called at the end of session.
+
+        The `session` argument can be used in case the hook wants to run final ops,
+        such as saving a last checkpoint.
+
+        If `session.run()` raises exception other than OutOfRangeError or
+        StopIteration then `end()` is not called.
+        Note the difference between `end()` and `after_run()` behavior when
+        `session.run()` raises OutOfRangeError or StopIteration. In that case
+        `end()` is called but `after_run()` is not called.
+
+        Args:
+        session: A TensorFlow Session that will be soon closed.
+        """
+            
+        # delete latest checkpoint file
+        input_checkpoint_files = Path(self._checkpoint_dir).glob(self._checkpoint_prefix + '*')
+        # print(input_checkpoint_files)
+        for f in input_checkpoint_files:
+            if f.exists():
+                f.unlink()
+                # print('DELETE: ', f)
+        tf.logging.debug("Removed input checkpoints")
+
+        last_step = session.run(self._global_step_tensor)
+        for l in self._listeners:
+            l.end(session, last_step)
+
+
+    def _save(self, session, step):
+        """Saves the latest checkpoint, returns should_stop."""
+        tf.logging.info("Saving\033[33m input\033[0m checkpoints for %d into %s.", step, self._save_path)
+
+        for l in self._listeners:
+            l.before_save(session, step)
+
+        self._get_saver().save(session, self._save_path, global_step=step)
+        self._summary_writer.add_session_log(
+            SessionLog(
+                status=SessionLog.CHECKPOINT, checkpoint_path=self._save_path),
+            step)
+
+        should_stop = False
+        for l in self._listeners:
+            if l.after_save(session, step):
+                tf.logging.info(
+                    "A CheckpointSaverListener requested that training be stopped. "
+                    "listener: {}".format(l))
+                should_stop = True
+        return should_stop
+
+    def _get_saver(self):
+        return self._saver
+
+
+class EpochCheckpointSaverHook(tf.train.CheckpointSaverHook):
+    """This checkpoint saver hook saves two types of checkpoints:
+
+    1. step: 
+    * Saves on save_secs or save_steps
+    * Does not save on begin or end
+    * Saves input pipeline state to continue training the remaining examples in the current epoch
+    * Separately configurable garbage collection criteria from epoch
+        * Defaults: max_to_keep=10, keep_checkpoint_every_n_hours=6
+    * The default list of CheckpointSaverListener does not run on step checkpoint saves,
+      you may configure a separate list of CheckpointSaverListeners by setting the step_listeners init arg
+    * filename = step
+    * latest_filename = step.latest
+    
+    2. epoch:
+    * Does not save on save_secs or save_steps
+    * Saves on epoch end
+    * Does not save input pipeline
+    * Separately configurable garbage collection criteria from step
+        * Does not garbage collect by default
+            * Defaults: max_to_keep=9999, keep_checkpoint_every_n_hours=999999
+        * set epoch_saver to a custom tf.train.Saver to change defaults
+    * The default list of CheckpointSaverListener only runs on epoch checkpoint saves,
+      this includes the default _NewCheckpointListenerForEvaluate added by tf.estimator.train_and_evaluate
+      which runs the eval loop after every new checkpoint
+    * filename = epoch
+    * latest_filename = epoch.latest
+    
+    Usage:
+    * Added to the list of EstimatorSpec.training_chief_hooks in your model_fn.
+      * This prevents the default CheckpointSaverHook from being added
+    * The end of an "epoch" is defined as the input_fn raising the OutOfRangeError,
+      don't repeat the dataset or set the repeat_count to 1 if you want to "expected" behavior of
+      one "epoch" is one iteration over all of the training data.
+    * estimator.train or tf.estimator.train_and_evaluate will exit after the OutOfRangeError,
+      wrap it with a for loop to train a limited number of epochs or a while True loop to train forever.
+
     Fixes more than one graph event per run warning in Tensorboard
     """
 
+    def __init__(self,
+                checkpoint_dir,
+                save_secs=None,
+                save_steps=None,
+                saver=None,
+                checkpoint_basename=None,
+                scaffold=None,
+                listeners=None,
+                step_listeners=None,
+                epoch_saver=None,
+                epoch_basename='epoch',
+                step_basename='step',
+                epoch_latest_filename='epoch.latest',
+                step_latest_filename='step.latest'):
+        """Maintains compatibility with the `CheckpointSaverHook`.
+
+        Args:
+        checkpoint_dir: `str`, base directory for the checkpoint files.
+        save_secs: `int`, save a step checkpoint every N secs.
+        save_steps: `int`, save a step checkpoint every N steps.
+        saver: `Saver` object, used for saving a final step checkpoint.
+        checkpoint_basename: `str`, base name for the checkpoint files.
+        scaffold: `Scaffold`, use to get saver object a final step checkpoint.
+        listeners: List of `CheckpointSaverListener` subclass instances.
+            Used for callbacks that run immediately before or after this hook saves
+            a epoch checkpoint.
+        step_listeners: List of `CheckpointSaverListener` subclass instances.
+            Used for callbacks that run immediately before or after this hook saves
+            a step checkpoint.
+        epoch_saver: `Saver` object, used for saving a epoch checkpoint.
+        step_basename: `str`, base name for the step checkpoint files.
+        epoch_basename: `str`, base name for the epoch checkpoint files.
+
+        Raises:
+        ValueError: One of `save_steps` or `save_secs` should be set.
+        ValueError: At most one of saver or scaffold should be set.
+        """
+        tf.logging.info("Create EpochCheckpointSaverHook.")
+        if saver is not None and scaffold is not None:
+            raise ValueError("You cannot provide both saver and scaffold.")
+        self._saver = saver
+        self._checkpoint_dir = checkpoint_dir
+        checkpoint_basename = checkpoint_basename or ''
+        epoch_basename = ''.join((checkpoint_basename, epoch_basename or 'step'))
+        step_basename = ''.join((checkpoint_basename, step_basename or 'step'))
+        self._epoch_save_path = os.path.join(checkpoint_dir, epoch_basename)
+        self._step_save_path = os.path.join(checkpoint_dir, step_basename)
+        self._epoch_latest_filename = epoch_latest_filename or 'epoch.latest'
+        self._step_latest_filename = step_latest_filename or 'step.latest'
+        self._scaffold = scaffold
+        self._timer = tf.train.SecondOrStepTimer(
+            every_secs=save_secs,
+            every_steps=save_steps
+        )
+        self._epoch_listeners = listeners or []
+        # In _train_with_estimator_spec
+        # saver_hooks[0]._listeners.extend(saving_listeners)
+        self._listeners = self._epoch_listeners
+        self._step_listeners = step_listeners or []
+        self._epoch_saver = epoch_saver
+        self._steps_per_run = 1
+
+    def _set_steps_per_run(self, steps_per_run):
+        self._steps_per_run = steps_per_run
+
+    def begin(self):
+        """Called once before using the session.
+
+        When called, the default graph is the one that will be launched in the
+        session.  The hook can modify the graph by adding new operations to it.
+        After the `begin()` call the graph will be finalized and the other callbacks
+        can not modify the graph anymore. Second call of `begin()` on the same
+        graph, should not change the graph.
+        """
+        self._summary_writer = tf.summary.FileWriterCache.get(self._checkpoint_dir)
+        self._global_step_tensor = training_util._get_or_create_global_step_read()  # pylint: disable=protected-access
+        if self._global_step_tensor is None:
+            raise RuntimeError(
+                "Global step should be created to use EpochCheckpointSaverHook.")
+                
+        if self._epoch_saver is None:
+            self._epoch_saver = tf.train.Saver(
+                sharded=False,
+                max_to_keep=9999,
+                keep_checkpoint_every_n_hours=999999,
+                defer_build=False,
+                save_relative_paths=True
+            )
+
+        for l in self._epoch_listeners:
+            l.begin()
+        for l in self._step_listeners:
+            l.begin()
+
     def after_create_session(self, session, coord):
+        """Called when new TensorFlow session is created.
+
+        This is called to signal the hooks that a new session has been created. This
+        has two essential differences with the situation in which `begin` is called:
+
+        * When this is called, the graph is finalized and ops can no longer be added
+            to the graph.
+        * This method will also be called as a result of recovering a wrapped
+            session, not only at the beginning of the overall session.
+
+        Args:
+        session: A TensorFlow Session that has been created.
+        coord: A Coordinator object which keeps track of all threads.
+        """
         global_step = session.run(self._global_step_tensor)
         # We do write graph and saver_def at the first call of before_run.
         # We cannot do this in begin, since we let other hooks to change graph and
@@ -387,10 +890,199 @@ class CheckpointSaverHook(tf.train.CheckpointSaverHook):
         tf.train.write_graph(
             tf.get_default_graph().as_graph_def(add_shapes=True),
             self._checkpoint_dir,
-            "graph.pbtxt")
+            "graph.pbtxt"
+        )
+        saver_def = self._get_saver().saver_def if self._get_saver() else None
+        graph = tf.get_default_graph()
+        meta_graph_def = meta_graph.create_meta_graph_def(
+            graph_def=graph.as_graph_def(add_shapes=True),
+            saver_def=saver_def)
+        self._summary_writer.add_graph(graph, global_step=global_step)
+        self._summary_writer.add_meta_graph(meta_graph_def, global_step=global_step)
         # The checkpoint saved here is the state at step "global_step".
-        self._save(session, global_step)
+        # do not save any checkpoints at start
+        # self._save(session, global_step)
         self._timer.update_last_triggered_step(global_step)
+
+    def before_run(self, run_context):  # pylint: disable=unused-argument
+        """Called before each call to run().
+
+        You can return from this call a `SessionRunArgs` object indicating ops or
+        tensors to add to the upcoming `run()` call.  These ops/tensors will be run
+        together with the ops/tensors originally passed to the original run() call.
+        The run args you return can also contain feeds to be added to the run()
+        call.
+
+        The `run_context` argument is a `SessionRunContext` that provides
+        information about the upcoming `run()` call: the originally requested
+        op/tensors, the TensorFlow Session.
+
+        At this point graph is finalized and you can not add ops.
+
+        Args:
+        run_context: A `SessionRunContext` object.
+
+        Returns:
+        None or a `SessionRunArgs` object.
+        """
+        return tf.train.SessionRunArgs(self._global_step_tensor)
+
+    def after_run(self, run_context, run_values):
+        """Called after each call to run().
+
+        The `run_values` argument contains results of requested ops/tensors by
+        `before_run()`.
+
+        The `run_context` argument is the same one send to `before_run` call.
+        `run_context.request_stop()` can be called to stop the iteration.
+
+        If `session.run()` raises any exceptions then `after_run()` is not called.
+
+        Args:
+        run_context: A `SessionRunContext` object.
+        run_values: A SessionRunValues object.
+        """
+        stale_global_step = run_values.results
+        if self._timer.should_trigger_for_step(stale_global_step + self._steps_per_run):
+            # get the real value after train op.
+            global_step = run_context.session.run(self._global_step_tensor)
+            if self._timer.should_trigger_for_step(global_step):
+                self._timer.update_last_triggered_step(global_step)
+                if self._save_step(run_context.session, global_step):
+                    run_context.request_stop()
+
+    def end(self, session):
+        """Called at the end of session.
+
+        The `session` argument can be used in case the hook wants to run final ops,
+        such as saving a last checkpoint.
+
+        If `session.run()` raises exception other than OutOfRangeError or
+        StopIteration then `end()` is not called.
+        Note the difference between `end()` and `after_run()` behavior when
+        `session.run()` raises OutOfRangeError or StopIteration. In that case
+        `end()` is called but `after_run()` is not called.
+
+        Args:
+        session: A TensorFlow Session that will be soon closed.
+        """
+        # savables = tf.get_collection(tf.GraphKeys.SAVEABLE_OBJECTS)
+        # savables_ref = tf.get_collection_ref(tf.GraphKeys.SAVEABLE_OBJECTS)
+        # print('SAVEABLE_OBJECTS before', len(savables_ref), savables_ref)
+        # # remove tensorflow.contrib.data.python.ops.iterator_ops._Saveable object
+        # for v in savables:
+        #     if isinstance(v, _Saveable):
+        #         savables_ref.remove(v)
+        # print('SAVEABLE_OBJECTS after', len(savables_ref), savables_ref)
+
+        last_step = session.run(self._global_step_tensor)
+        
+        if last_step != self._timer.last_triggered_step():
+            self._save_step(session, last_step)
+        
+        self._save_epoch(session, last_step)
+        
+        for l in self._epoch_listeners:
+            # _NewCheckpointListenerForEvaluate will run here at end
+            l.end(session, last_step)
+        
+        for l in self._step_listeners:
+            l.end(session, last_step)
+
+    def _save_epoch(self, session, step):
+        """Saves the latest checkpoint, returns should_stop."""
+        tf.logging.info("Saving\033[1;31m epoch\033[0m checkpoints for %d into %s.", step, self._epoch_save_path)
+
+        for l in self._epoch_listeners:
+            l.before_save(session, step)
+
+        self._get_epoch_saver().save(
+            sess=session, 
+            save_path=self._epoch_save_path, 
+            global_step=step,
+            latest_filename=self._epoch_latest_filename,
+            meta_graph_suffix="meta",
+            write_meta_graph=True,
+            write_state=True,
+            strip_default_attrs=False
+        )
+
+        should_stop = False
+        for l in self._epoch_listeners:
+            # _NewCheckpointListenerForEvaluate will not run here 
+            # since _is_first_run == True, it will run at end
+            if l.after_save(session, step):
+                tf.logging.info(
+                    "An Epoch CheckpointSaverListener requested that training be stopped. "
+                    "listener: {}".format(l))
+                should_stop = True
+        return should_stop
+
+    def _save_step(self, session, step):
+        """Saves the latest checkpoint, returns should_stop."""
+        tf.logging.info("Saving\033[1;32m step\033[0m checkpoints for %d into %s.", step, self._step_save_path)
+
+        for l in self._step_listeners:
+            l.before_save(session, step)
+        
+        saver = self._get_step_saver()
+        
+        saver.save(
+            sess=session, 
+            save_path=self._step_save_path, 
+            global_step=step,
+            # latest_filename=self._step_latest_filename,
+            latest_filename=None,
+            meta_graph_suffix="meta",
+            write_meta_graph=True,
+            write_state=True,
+            strip_default_attrs=False
+        )
+        self._summary_writer.add_session_log(
+            SessionLog(status=SessionLog.CHECKPOINT, checkpoint_path=self._step_save_path),
+            step
+        )
+
+        should_stop = False
+        for l in self._step_listeners:
+            if l.after_save(session, step):
+                tf.logging.info(
+                    "A Step CheckpointSaverListener requested that training be stopped. "
+                    "listener: {}".format(l))
+                should_stop = True
+        return should_stop
+
+    def _save(self, session, step):
+        """Saves the latest checkpoint, returns should_stop."""
+        return self._save_step(session, step)
+
+    def _get_epoch_saver(self):
+        return self._epoch_saver
+
+    def _get_step_saver(self):
+        if self._saver is not None:
+            return self._saver
+        elif self._scaffold is not None:
+            return self._scaffold.saver
+
+        # Get saver from the SAVERS collection if present.
+        collection_key = tf.GraphKeys.SAVERS
+        savers = tf.get_collection(collection_key)
+        if not savers:
+            raise RuntimeError(
+                "No items in collection {}. Please add a saver to the collection "
+                "or provide a saver or scaffold.".format(collection_key))
+        elif len(savers) > 1:
+            raise RuntimeError(
+                "More than one item in collection {}. "
+                "Please indicate which one to use by passing it to the constructor.".
+                format(collection_key))
+
+        self._saver = savers[0]
+        return savers[0]
+
+    def _get_saver(self):
+        return self._get_step_saver()
 
 # num_domain = 10
 # test_split = 0.2
@@ -786,6 +1478,41 @@ def model_fn(features, labels, mode, params, config):
                                      summarize=50000
                                      )
         )
+
+    training_hooks = []
+    # INFO:tensorflow:global_step/sec: 2.07549
+    training_hooks.append(tf.train.StepCounterHook(
+        output_dir=params.model_dir,
+        every_n_steps=params.log_step_count_steps
+    ))
+    # INFO:tensorflow:accuracy = 0.16705106, examples = 15000, loss = 9.688441, step = 150 (24.091 sec)
+    def logging_formatter(tensor_values):
+        pass
+    training_hooks.append(tf.train.LoggingTensorHook(
+        tensors={
+            'accuracy': batch_accuracy,
+            'loss': loss,
+            'step': global_step,
+            'input_size': tf.shape(protein),
+            'examples': examples_processed
+        },
+        every_n_iter=params.log_step_count_steps,
+        at_end=False, formatter=None
+    ))
+    if params.trace:
+        training_hooks.append(tf.train.ProfilerHook(
+            save_steps=params.save_summary_steps,
+            output_dir=params.model_dir,
+            show_dataflow=True,
+            show_memory=True
+        ))
+    training_hooks.append(EpochCheckpointInputPipelineHook(
+        checkpoint_dir=params.model_dir,
+        config=config,
+        save_secs=params.save_checkpoints_secs, # 10m
+        save_steps=None,
+    ))
+
     # default saver is added in estimator._train_with_estimator_spec
     # training.Saver(
     #   sharded=True,
@@ -802,28 +1529,48 @@ def model_fn(features, labels, mode, params, config):
         defer_build=True,
         save_relative_paths=True))
 
-    training_hooks = []
-    training_hooks.append(tf.train.StepCounterHook(
-        output_dir=params.model_dir,
-        every_n_steps=params.log_step_count_steps
-    ))
-    # training_hooks.append(tf.train.LoggingTensorHook(
-    #     tensors={
-    #         'accuracy': batch_accuracy,
-    #         'loss': loss,
-    #         'step': global_step,
-    #         # 'input_size': tf.shape(protein),
-    #         'examples': examples_processed
-    #     },
-    #     every_n_iter=params.log_step_count_steps
+    training_chief_hooks = []
+    # # saving_listeners like _NewCheckpointListenerForEvaluate 
+    # # will be called on the first CheckpointSaverHook
+    # training_chief_hooks.append(tf.train.CheckpointSaverHook(
+    #     checkpoint_dir=params.model_dir,
+    #     # effectively only save on start and end of MonitoredTrainingSession
+    #     save_secs=30 * 24 * 60 * 60,
+    #     save_steps=None,
+    #     checkpoint_basename="model.epoch",
+    #     saver=tf.train.Saver(
+    #         sharded=False,
+    #         max_to_keep=0,
+    #         defer_build=False,
+    #         save_relative_paths=True
+    #     )
     # ))
-    if params.trace:
-        training_hooks.append(tf.train.ProfilerHook(
-            save_steps=params.save_summary_steps,
-            output_dir=params.model_dir,
-            show_dataflow=True,
-            show_memory=True
-        ))
+    # # Add a second CheckpointSaverHook to save every save_checkpoints_secs
+    # training_chief_hooks.append(tf.train.CheckpointSaverHook(
+    #     checkpoint_dir=params.model_dir,
+    #     save_secs=params.save_checkpoints_secs, # 10m
+    #     save_steps=None,
+    #     checkpoint_basename="model.step",
+    #     scaffold=scaffold
+    # ))
+    training_chief_hooks.append(EpochCheckpointSaverHook(
+        checkpoint_dir=params.model_dir,
+        save_secs=params.save_checkpoints_secs, # 10m
+        save_steps=None,
+        scaffold=scaffold
+    ))
+
+    # local training:
+    # all_hooks=[
+    # EpochCheckpointSaverHook, Added into training_chief_hooks in this model_fn
+    # SummarySaverHook, # Added into chief_hooks in MonitoredTrainingSession()
+    # _DatasetInitializerHook, # Added into worker_hooks in Estimator._train_model_default
+    # NanTensorHook, # Added into worker_hooks in Estimator._train_with_estimator_spec
+    # StepCounterHook, # Added into training_hooks in this model_fn
+    # LoggingTensorHook,  # Added into training_hooks in this model_fn
+    # EpochCheckpointInputPipelineHook # Added into training_hooks in this model_fn
+    # ]
+
     return tf.estimator.EstimatorSpec(
         mode=mode,
         predictions=predictions,
@@ -834,7 +1581,7 @@ def model_fn(features, labels, mode, params, config):
             'predictions': tf.estimator.export.PredictOutput(predictions)
         },
         scaffold=scaffold,
-        training_chief_hooks=None,
+        training_chief_hooks=training_chief_hooks,
         training_hooks=training_hooks,
         evaluation_hooks=None,
         prediction_hooks=None
@@ -855,6 +1602,7 @@ def create_estimator_and_specs(run_config):
         use_tensor_ops=FLAGS.use_tensor_ops,
         save_summary_steps=FLAGS.save_summary_steps,
         save_checkpoints_steps=FLAGS.save_checkpoints_steps,
+        save_checkpoints_secs=FLAGS.save_checkpoints_secs,
         keep_checkpoint_max=FLAGS.keep_checkpoint_max,
         keep_checkpoint_every_n_hours=FLAGS.keep_checkpoint_every_n_hours,
         log_step_count_steps=FLAGS.log_step_count_steps,
@@ -918,19 +1666,24 @@ def create_estimator_and_specs(run_config):
         params=model_params)
 
     # save model_params to model_dir/hparams.json
-    hparams_f = Path(estimator.model_dir,
+    hparams_path = Path(estimator.model_dir,
                      'hparams-{:%Y-%m-%d-%H-%M-%S}.json'.format(datetime.datetime.now()))
-    hparams_f.parent.mkdir(parents=True, exist_ok=True)
-    hparams_f.write_text(model_params.to_json(indent=2, sort_keys=False))
+    hparams_path.parent.mkdir(parents=True, exist_ok=True)
+    hparams_path.write_text(model_params.to_json(indent=2, sort_keys=False))
 
     train_spec = tf.estimator.TrainSpec(
         input_fn=input_fn,
         # A function that provides input data for training as minibatches.
-        max_steps=FLAGS.steps or None,  # 0
+        # max_steps=FLAGS.steps or None,  # 0
+        max_steps=None,
         # Positive number of total steps for which to train model. If None, train forever.
-        hooks=None
+        hooks=None 
+        # passed into estimator.train(hooks)
+        # and then into _train_with_estimator_spec(hooks)
         # Iterable of `tf.train.SessionRunHook` objects to run
         # on all workers (including chief) during training.
+        # CheckpointSaverHook? Not here, need only to run on cchief, put in 
+        # estimator_spec.training_chief_hooks
     )
 
     eval_spec = tf.estimator.EvalSpec(
@@ -964,6 +1717,16 @@ def create_estimator_and_specs(run_config):
 
 
 def main(unused_args):
+    # check tfrecords data exists
+    if len(glob.glob(FLAGS.training_data)) == 0:
+        msg = 'No training data files found for pattern: {}'.format(FLAGS.training_data)
+        tf.logging.fatal(msg)
+        raise IOError(msg)
+    if len(glob.glob(FLAGS.eval_data)) == 0:
+        msg = 'No evaluation data files found for pattern: {}'.format(FLAGS.eval_data)
+        tf.logging.fatal(msg)
+        raise IOError(msg)
+    
     # Hardware info
     FLAGS.num_gpus = FLAGS.num_gpus or tf.contrib.eager.num_gpus()
     FLAGS.num_cpu_threads = FLAGS.num_cpu_threads or os.cpu_count()
@@ -989,44 +1752,57 @@ def main(unused_args):
             # path will be resolved. If `None`, the model_dir in `config` will be used
             # if set. If both are set, they must be same. If both are `None`, a
             # temporary directory will be used.
-            tf_random_seed=FLAGS.random_seed,
+            tf_random_seed=FLAGS.random_seed,  # 33
             # Random seed for TensorFlow initializers.
             # Setting this value allows consistency between reruns.
             save_summary_steps=FLAGS.save_summary_steps,  # 10
+            # if not None, a SummarySaverHook will be added in MonitoredTrainingSession()
             # The frequency, in number of global steps, that the
             # summaries are written to disk using a default SummarySaverHook. If both
             # `save_summaries_steps` and `save_summaries_secs` are set to `None`, then
             # the default summary saver isn't used. Default 100.
-            # save_checkpoints_steps=FLAGS.save_checkpoints_steps, # 100
+            save_checkpoints_steps=None, # 100
             # Save checkpoints every this many steps.
-            save_checkpoints_secs=FLAGS.save_checkpoints_secs,  # 10 * 60
+            # save_checkpoints_secs=None,
+            # We will define our own CheckpointSaverHook in EstimatorSpec.training_chief_hooks
+            save_checkpoints_secs=FLAGS.save_checkpoints_secs,  # 10m
+            # if not None, a CheckpointSaverHook will be added in MonitoredTrainingSession()
             # Save checkpoints every this many seconds with
             # CheckpointSaverHook. Can not be specified with `save_checkpoints_steps`.
             # Defaults to 600 seconds if both `save_checkpoints_steps` and
             # `save_checkpoints_secs` are not set in constructor.
             # If both `save_checkpoints_steps` and `save_checkpoints_secs` are None,
             # then checkpoints are disabled.
-            keep_checkpoint_max=FLAGS.keep_checkpoint_max,  # 10
+            keep_checkpoint_max=FLAGS.keep_checkpoint_max,  # 5
             # Maximum number of checkpoints to keep.  As new checkpoints
             # are created, old ones are deleted.  If None or 0, no checkpoints are
             # deleted from the filesystem but only the last one is kept in the
             # `checkpoint` file.  Presently the number is only roughly enforced.  For
             # example in case of restarts more than max_to_keep checkpoints may be
             # kept.
-            keep_checkpoint_every_n_hours=FLAGS.keep_checkpoint_every_n_hours,  # 1
+            keep_checkpoint_every_n_hours=FLAGS.keep_checkpoint_every_n_hours,  # 6
             # keep an additional checkpoint
             # every `N` hours. For example, if `N` is 0.5, an additional checkpoint is
             # kept for every 0.5 hours of training, this is in addition to the
             # keep_checkpoint_max checkpoints.
             # Defaults to 10,000 hours.
-            # log_step_count_steps=None, # Customized LoggingTensorHook defined in model_fn
-            log_step_count_steps=FLAGS.log_step_count_steps,  # 10
+            log_step_count_steps=None, # Customized LoggingTensorHook defined in model_fn
+            # if not None, a StepCounterHook will be added in MonitoredTrainingSession()
+            # log_step_count_steps=FLAGS.log_step_count_steps,  # 10
             # The frequency, in number of global steps, that the
             # global step/sec will be logged during training.
             session_config=session_config))
-
-    eval_result_metrics, export_results = tf.estimator.train_and_evaluate(
-        estimator, train_spec, eval_spec)
+    
+    while True:
+        eval_result_metrics, export_results = tf.estimator.train_and_evaluate(
+            estimator, train_spec, eval_spec)
+    # eval_result = _EvalResult(
+    #   status=_EvalStatus.EVALUATED,
+    #   metrics=metrics,
+    #   checkpoint_path=latest_ckpt_path)
+    # export_results = [eval_spec.exporters.export(), ...
+    # eval_spec.exporters.export() = The string path to the exported directory.
+        
     # _TrainingExecutor.run()
     # _TrainingExecutor.run_local()
     # estimator.train(input_fn, max_steps)
@@ -1124,7 +1900,14 @@ def main(unused_args):
 # python main.py --training_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=C:\Users\Hotdogee\Documents/checkpoints/d0b1-12-5930k --num_classes=16715 --batch_size=1 --save_summary_steps=20 --log_step_count_steps=20 --decay_steps=1000000 --learning_rate=0.001 --adam_epsilon=0.0001
 # Stuck at accuracy
 # python main.py --training_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=C:\Users\Hotdogee\Documents/checkpoints/d0b1-13-5930k --num_classes=16715 --batch_size=1 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.01 --adam_epsilon=0.05
-# Stuck at accuracy
+# Stuck at accuracy 21, 24, 25, 26, 24, 24, 26, 27, 29, 30, 31, 30
+# python main.py --training_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=C:\Users\Hotdogee\Documents\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=C:\Users\Hotdogee\Documents/checkpoints/d0b1-14-5930k --num_classes=16715 --batch_size=1 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=10000 --learning_rate=0.0001 --adam_epsilon=0.02 
+# With CUDA 9.2 CUDNN 7.1.4:
+# INFO:tensorflow:loss = 9.671407, step = 200 (80.576 sec)
+# INFO:tensorflow:loss = 9.610422, step = 400 (78.203 sec)
+# With CUDA 9.2 CUDNN 7.1.4 MKL:
+# INFO:tensorflow:loss = 9.671407, step = 200 (79.954 sec)
+# INFO:tensorflow:loss = 9.610422, step = 400 (78.346 sec)
 
 # python main.py --training_data=D:\datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:\datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0b2nan-1-1950x --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=1000000 --learning_rate=0.01
 # NaN at 400
@@ -1143,6 +1926,38 @@ def main(unused_args):
 # INFO:tensorflow:loss = 4.526874, step = 200 (123.831 sec)
 # $Env:CUDA_VISIBLE_DEVICES=1; python main.py --training_data=D:/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:/datasets/pfam-regions-d0-s20-test.tfrecords --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=10000 --learning_rate=0.01 --adam_epsilon=0.02 --model_dir=D:/checkpoints/d0b2-11-1950x-1080Ti --use_tensor_ops=true
 # INFO:tensorflow:loss = 4.526843, step = 200 (137.962 sec)
+####################
+## Compiled using CUDA 9.2 CUDNN 7.1.4
+# $Env:CUDA_VISIBLE_DEVICES=0; python main.py --training_data=D:/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:/datasets/pfam-regions-d0-s20-test.tfrecords --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=10000 --learning_rate=0.01 --adam_epsilon=0.02 --model_dir=D:/checkpoints/d0b2-15-1950x-TITANV
+# INFO:tensorflow:loss = 4.5400643, step = 200 (85.344 sec)
+# $Env:TF_AUTOTUNE_THRESHOLD=1
+# $Env:TF_DEBUG_CUDNN_RNN=1
+# $Env:TF_DEBUG_CUDNN_RNN_ALGO=1
+# $Env:TF_DEBUG_CUDNN_RNN_USE_TENSOR_OPS=0
+# $Env:TF_CUDNN_USE_AUTOTUNE=1
+# $Env:TF_CUDNN_RNN_USE_AUTOTUNE=1
+# $Env:TF_ENABLE_TENSOR_OP_MATH=1
+# $Env:TF_ENABLE_TENSOR_OP_MATH_FP32=1
+# $Env:CUDA_VISIBLE_DEVICES=0; python main.py --training_data=D:/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:/datasets/pfam-regions-d0-s20-test.tfrecords --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=10000 --learning_rate=0.01 --adam_epsilon=0.02 --model_dir=D:/checkpoints/d0b2-16-1950x-TITANV
+# INFO:tensorflow:loss = 4.5400643, step = 200 (96.615 sec)
+# $Env:TF_DEBUG_CUDNN_RNN_USE_TENSOR_OPS=1
+# $Env:CUDA_VISIBLE_DEVICES=0; python main.py --training_data=D:/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:/datasets/pfam-regions-d0-s20-test.tfrecords --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=10000 --learning_rate=0.01 --adam_epsilon=0.02 --model_dir=D:/checkpoints/d0b2-17-1950x-TITANV
+# ERROR:tensorflow:Model diverged with loss = NaN.
+# $Env:CUDA_VISIBLE_DEVICES=0; python main.py --training_data=D:/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:/datasets/pfam-regions-d0-s20-test.tfrecords --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=10000 --learning_rate=0.0001 --adam_epsilon=0.02 --model_dir=D:/checkpoints/d0b2-18-1950x-TITANV
+# INFO:tensorflow:loss = 9.653481, step = 200 (78.383 sec)
+# $Env:CUDA_VISIBLE_DEVICES=0; python main.py --training_data=D:/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:/datasets/pfam-regions-d0-s20-test.tfrecords --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=10000 --learning_rate=0.0001 --adam_epsilon=0.02 --model_dir=D:/checkpoints/d0b2-19-1950x-TITANV --use_tensor_ops=true
+# INFO:tensorflow:loss = 9.655021, step = 200 (83.497 sec)
+# $Env:TF_DEBUG_CUDNN_RNN_ALGO=2
+# $Env:TF_DEBUG_CUDNN_RNN_USE_TENSOR_OPS=0
+# $Env:CUDA_VISIBLE_DEVICES=0; python main.py --training_data=D:/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=D:/datasets/pfam-regions-d0-s20-test.tfrecords --num_classes=16715 --batch_size=2 --save_summary_steps=200 --log_step_count_steps=200 --decay_steps=10000 --learning_rate=0.0001 --adam_epsilon=0.02 --model_dir=D:/checkpoints/d0b2-20-1950x-TITANV
+# INFO:tensorflow:loss = 9.6519, step = 200 (116.726 sec)
+# $Env:TF_DEBUG_CUDNN_RNN_ALGO=0
+# $Env:TF_DEBUG_CUDNN_RNN_USE_TENSOR_OPS=1
+# $Env:CUDA_VISIBLE_DEVICES=0; python main.py --training_data=D:/datasets2/pfam-regions-d0-s20-p1-train.tfrecords --eval_data=D:/datasets2/pfam-regions-d0-s20-p1-test.tfrecords --num_classes=16715 --batch_size=2 --save_summary_steps=50 --log_step_count_steps=50 --decay_steps=10000 --learning_rate=0.0001 --adam_epsilon=0.02 --model_dir=D:/checkpoints/pfam-regions-d0-s20-p1/1950x-TITANV/d0b2-1
+# 
+# $Env:CUDA_VISIBLE_DEVICES=0; python main.py --training_data=D:/datasets2/pfam-regions-d4000-s20-t1-e1-train.tfrecords --eval_data=D:/datasets2/pfam-regions-d4000-s20-t1-e1-test.tfrecords --num_classes=4003 --batch_size=2 --save_summary_steps=50 --log_step_count_steps=5 --decay_steps=10000 --learning_rate=0.0001 --adam_epsilon=0.02 --save_checkpoints_secs=3 --keep_checkpoint_max=2 --model_dir=D:/checkpoints/pfam-regions-d4000-s20-t1-e1/1950x-TITANV/b2-lr0.0001-2
+#
+
 
 # sequence count = 54,223,493, train = 43,378,794, test = 10,844,699
 # class count = 16715, batch size = 4, batch count = 13,555,873, batch per sec = 11, time per epoch = 1,232,352 sec = 14 days
@@ -1315,7 +2130,7 @@ if __name__ == '__main__':
     parser.add_argument(
         '--repeat_count',
         type=int,
-        default=-1,
+        default=1,
         help='Number of times the dataset should be repeated.')
     parser.add_argument(
         '--batch_size',
