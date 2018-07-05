@@ -25,11 +25,15 @@ import sys
 import ast
 import glob
 import json
+import logging
 import argparse
 import datetime
 import functools
 from pathlib import Path
 
+import colorama
+from colorama import Fore, Back, Style
+colorama.init() # this needs to run before first run of tf_logging._get_logger()
 import tensorflow as tf
 from tensorflow.python.ops import variables
 from tensorflow.python.data.ops import iterator_ops
@@ -41,15 +45,31 @@ from tensorflow.python.data.util import nest
 from tensorflow.contrib.layers.python.layers import adaptive_clipping_fn
 from tensorflow.core.protobuf import rewriter_config_pb2
 from tensorflow.python import debug as tf_debug
-from tensorflow.python.platform import tf_logging as logging
+from tensorflow.python.platform import tf_logging
 import numpy as np
-from colorama import init, Fore, Back, Style
 import coloredlogs
+from tqdm import tqdm
+
+class TqdmFile(object):
+    """ A file-like object that will write to tqdm"""
+    file = None
+    def __init__(self, file):
+        self.file = file
+
+    def write(self, x):
+        # Avoid print() second call (useless \n)
+        if len(x.rstrip()) > 0:
+            # print(Fore.RED + 'some red text' + Style.RESET_ALL)
+            tqdm.write(x, file=self.file)
+
+    def flush(self):
+        return getattr(self.file, "flush", lambda: None)()
 
 # Disable cpp warnings
 # os.environ['TF_CPP_MIN_LOG_LEVEL']='2'
 # Show debugging output, default: tf.logging.INFO
-logger = logging._get_logger()
+
+# setup coloredlogs
 coloredlogs.DEFAULT_FIELD_STYLES = dict(
     asctime=dict(color='green'),
     hostname=dict(color='magenta'),
@@ -66,8 +86,32 @@ coloredlogs.DEFAULT_LEVEL_STYLES = dict(
     success=dict(color='green', bold=True),
     error=dict(color='red'),
     critical=dict(color='red', bold=True))
-coloredlogs.install(level='DEBUG', logger=logger, milliseconds=True)
+logger = tf_logging._get_logger()
+coloredlogs.install(
+    level='DEBUG', 
+    logger=logger, 
+    milliseconds=True,
+    stream=logger.handlers[0].stream
+)
+# print(Fore.RED + 'some red text' + Style.RESET_ALL, file=logger.handlers[0].stream)
+
+# set logger.handler.stream to output to our TqdmFile
+orig_stdout = sys.stdout
+for h in logger.handlers:
+    # <StreamHandler <stderr> (NOTSET)>
+    # <StandardErrorHandler <stderr> (DEBUG)>
+    # print(h)
+    h.acquire()
+    try:
+        h.flush()
+        orig_stdout = h.stream
+        h.stream = TqdmFile(file=h.stream)
+    finally:
+        h.release()
+
 tf.logging.set_verbosity(tf.logging.DEBUG)
+
+# tf.logging.debug('test')
 
 FLAGS = None
 
@@ -1095,6 +1139,124 @@ class EpochCheckpointSaverHook(tf.train.CheckpointSaverHook):
     def _get_saver(self):
         return self._get_step_saver()
 
+class EpochProgressBarHook(tf.train.SessionRunHook):
+    def __init__(self,
+                 total,
+                 initial_tensor,
+                 n_tensor,
+                 postfix_tensors=None,
+                 every_n_iter=None):
+        self._total = total
+        self._initial_tensor = initial_tensor
+        self._n_tensor = n_tensor
+        self._postfix_tensors = postfix_tensors
+        self._every_n_iter = every_n_iter
+    
+    def begin(self):
+        """Called once before using the session.
+
+        When called, the default graph is the one that will be launched in the
+        session.  The hook can modify the graph by adding new operations to it.
+        After the `begin()` call the graph will be finalized and the other callbacks
+        can not modify the graph anymore. Second call of `begin()` on the same
+        graph, should not change the graph.
+        """
+        pass
+        
+    def after_create_session(self, session, coord):
+        """Called when new TensorFlow session is created.
+
+        This is called to signal the hooks that a new session has been created. This
+        has two essential differences with the situation in which `begin` is called:
+
+        * When this is called, the graph is finalized and ops can no longer be added
+            to the graph.
+        * This method will also be called as a result of recovering a wrapped
+            session, not only at the beginning of the overall session.
+
+        Args:
+        session: A TensorFlow Session that has been created.
+        coord: A Coordinator object which keeps track of all threads.
+        """
+        initial = session.run(self._initial_tensor)
+        epoch = initial // self._total
+        epoch_initial = initial % self._total
+        print('after_create_session', initial, epoch)
+        # setup progressbar
+        self.pbar = tqdm(
+            total=self._total,
+            unit='seq',
+            desc='Epoch {}'.format(epoch),
+            mininterval=0.1,
+            maxinterval=10.0,
+            miniters=None,
+            file=orig_stdout,
+            dynamic_ncols=True,
+            smoothing=0.3,
+            bar_format=None,
+            initial=epoch_initial,
+            postfix=None
+        )
+        
+    def before_run(self, run_context):  # pylint: disable=unused-argument
+        """Called before each call to run().
+
+        You can return from this call a `SessionRunArgs` object indicating ops or
+        tensors to add to the upcoming `run()` call.  These ops/tensors will be run
+        together with the ops/tensors originally passed to the original run() call.
+        The run args you return can also contain feeds to be added to the run()
+        call.
+
+        The `run_context` argument is a `SessionRunContext` that provides
+        information about the upcoming `run()` call: the originally requested
+        op/tensors, the TensorFlow Session.
+
+        At this point graph is finalized and you can not add ops.
+
+        Args:
+        run_context: A `SessionRunContext` object.
+
+        Returns:
+        None or a `SessionRunArgs` object.
+        """
+        return tf.train.SessionRunArgs(self._n_tensor)
+        
+    def after_run(self, run_context, run_values):
+        """Called after each call to run().
+
+        The `run_values` argument contains results of requested ops/tensors by
+        `before_run()`.
+
+        The `run_context` argument is the same one send to `before_run` call.
+        `run_context.request_stop()` can be called to stop the iteration.
+
+        If `session.run()` raises any exceptions then `after_run()` is not called.
+
+        Args:
+        run_context: A `SessionRunContext` object.
+        run_values: A SessionRunValues object.
+        """
+        # print('run_values', run_values.results)
+        # update progressbar
+        self.pbar.update(run_values.results)
+
+    def end(self, session):
+        """Called at the end of session.
+
+        The `session` argument can be used in case the hook wants to run final ops,
+        such as saving a last checkpoint.
+
+        If `session.run()` raises exception other than OutOfRangeError or
+        StopIteration then `end()` is not called.
+        Note the difference between `end()` and `after_run()` behavior when
+        `session.run()` raises OutOfRangeError or StopIteration. In that case
+        `end()` is called but `after_run()` is not called.
+
+        Args:
+        session: A TensorFlow Session that will be soon closed.
+        """
+        self.pbar.close()
+
 # num_domain = 10
 # test_split = 0.2
 # validation_split = 0.1
@@ -1475,9 +1637,14 @@ def model_fn(features, labels, mode, params, config):
 
     # record total number of examples processed
     examples_processed = tf.Variable(
-        0, trainable=False, name='examples_processed')
+        0, 
+        trainable=False,
+        dtype=tf.int64,
+        name='examples_processed'
+    )
+    # print('examples_processed', examples_processed)
     group_inputs.append(tf.assign_add(examples_processed,
-                                      batch_size, name='update_examples_processed'))
+                                      tf.cast(batch_size, tf.int64), name='update_examples_processed'))
     epoch = examples_processed // seq_total
     group_inputs.append(epoch)
     progress = examples_processed / seq_total - tf.cast(epoch, tf.float64)
@@ -1515,17 +1682,24 @@ def model_fn(features, labels, mode, params, config):
         'accuracy': batch_accuracy,
         'loss': loss,
         'step': global_step,
-        'input_size': tf.shape(protein),
-        'examples': examples_processed
+        # 'input_size': tf.shape(protein),
+        # 'examples': examples_processed
     }
-    if is_train:
-        tensors['epoch'] = epoch
-        tensors['progress'] = progress
+    # if is_train:
+    #     tensors['epoch'] = epoch
+    #     tensors['progress'] = progress
         
     training_hooks.append(tf.train.LoggingTensorHook(
         tensors=tensors,
         every_n_iter=params.log_step_count_steps,
         at_end=False, formatter=None
+    ))
+    training_hooks.append(EpochProgressBarHook(
+        total=seq_total,
+        initial_tensor=examples_processed,
+        n_tensor=batch_size,
+        postfix_tensors=None,
+        every_n_iter=params.log_step_count_steps
     ))
     if params.trace:
         training_hooks.append(tf.train.ProfilerHook(
