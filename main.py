@@ -72,9 +72,9 @@ class TqdmFile(object):
 # setup coloredlogs
 coloredlogs.DEFAULT_FIELD_STYLES = dict(
     asctime=dict(color='green'),
-    hostname=dict(color='magenta'),
+    hostname=dict(color='magenta', bold=True),
     levelname=dict(color='black', bold=True),
-    programname=dict(color='cyan'),
+    programname=dict(color='cyan', bold=True),
     name=dict(color='blue'))
 coloredlogs.DEFAULT_LEVEL_STYLES = dict(
     spam=dict(color='green', faint=True),
@@ -755,7 +755,7 @@ class EpochCheckpointInputPipelineHook(tf.train.SessionRunHook):
 
     def _save(self, session, step):
         """Saves the latest checkpoint, returns should_stop."""
-        tf.logging.info("Saving\033[33m input\033[0m checkpoints for %d into %s.", step, self._save_path)
+        tf.logging.info("Saving\033[31m input\033[0m checkpoints for %d into %s.", step, self._save_path)
 
         for l in self._listeners:
             l.before_save(session, step)
@@ -1075,7 +1075,7 @@ class EpochCheckpointSaverHook(tf.train.CheckpointSaverHook):
 
     def _save_step(self, session, step):
         """Saves the latest checkpoint, returns should_stop."""
-        tf.logging.info("Saving\033[1;32m step\033[0m checkpoints for %d into %s.", step, self._step_save_path)
+        tf.logging.info("Saving\033[1;31m step\033[0m checkpoints for %d into %s.", step, self._step_save_path)
 
         for l in self._step_listeners:
             l.before_save(session, step)
@@ -1181,7 +1181,7 @@ class EpochProgressBarHook(tf.train.SessionRunHook):
         initial = session.run(self._initial_tensor)
         epoch = initial // self._total
         epoch_initial = initial % self._total
-        print('after_create_session', initial, epoch)
+        # print('after_create_session', initial, epoch)
         # setup progressbar
         self.pbar = tqdm(
             total=self._total,
@@ -1256,6 +1256,38 @@ class EpochProgressBarHook(tf.train.SessionRunHook):
         session: A TensorFlow Session that will be soon closed.
         """
         self.pbar.close()
+
+class ColoredLoggingTensorHook(tf.train.LoggingTensorHook):
+  """Prints the given tensors every N local steps, every N seconds, or at end.
+
+  The tensors will be printed to the log, with `INFO` severity. If you are not
+  seeing the logs, you might want to add the following line after your imports:
+
+  ```python
+    tf.logging.set_verbosity(tf.logging.INFO)
+  ```
+
+  Note that if `at_end` is True, `tensors` should not include any tensor
+  whose evaluation produces a side effect such as consuming additional inputs.
+  """
+  def _log_tensors(self, tensor_values):
+    original = np.get_printoptions()
+    np.set_printoptions(suppress=True)
+    elapsed_secs, _ = self._timer.update_last_triggered_step(self._iter_count)
+    if self._formatter:
+      if elapsed_secs is not None:
+        tf.logging.info("%s (%.3f sec)", self._formatter(tensor_values), elapsed_secs)
+      else:
+        tf.logging.info(self._formatter(tensor_values))
+    else:
+      stats = []
+      for tag in self._tag_order:
+        stats.append("%s = %s" % (tag, tensor_values[tag]))
+      if elapsed_secs is not None:
+        tf.logging.info("%s (%.3f sec)", ", ".join(stats), elapsed_secs)
+      else:
+        tf.logging.info("%s", ", ".join(stats))
+    np.set_printoptions(**original)
 
 # num_domain = 10
 # test_split = 0.2
@@ -1675,8 +1707,8 @@ def model_fn(features, labels, mode, params, config):
         every_n_steps=params.log_step_count_steps
     ))
     # INFO:tensorflow:accuracy = 0.16705106, examples = 15000, loss = 9.688441, step = 150 (24.091 sec)
-    def logging_formatter(tensor_values):
-        pass
+    def logging_formatter(v):
+        return 'accuracy:\033[1;32m {:9.5%}\033[0m, loss:\033[1;32m {:8.5f}\033[0m, step:\033[1;32m {:7,d}\033[0m'.format(v['accuracy'], v['loss'], v['step'])
 
     tensors = {
         'accuracy': batch_accuracy,
@@ -1689,10 +1721,10 @@ def model_fn(features, labels, mode, params, config):
     #     tensors['epoch'] = epoch
     #     tensors['progress'] = progress
         
-    training_hooks.append(tf.train.LoggingTensorHook(
+    training_hooks.append(ColoredLoggingTensorHook(
         tensors=tensors,
         every_n_iter=params.log_step_count_steps,
-        at_end=False, formatter=None
+        at_end=False, formatter=logging_formatter
     ))
     training_hooks.append(EpochProgressBarHook(
         total=seq_total,
