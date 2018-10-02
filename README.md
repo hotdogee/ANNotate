@@ -88,8 +88,10 @@ optional arguments:
 
 # Train modal
 
+`python models/pfam-regions/v5-BiRnn.py`
+
 ## Train with 10 class dataset, using batch size of 64
-```python main.py --training_data=/home/user/datasets/pfam-regions-d10-s20-train.tfrecords --eval_data=/home/user/datasets/pfam-regions-d10-s20-test.tfrecords --model_dir=./checkpoints/d10-v1 --batch_size=64```
+```python models/pfam-regions/v5-BiRnn.py --training_data=/home/user/datasets/pfam-regions-d10-s20-train.tfrecords --eval_data=/home/user/datasets/pfam-regions-d10-s20-test.tfrecords --model_dir=./checkpoints/d10-v1 --batch_size=64```
 
 ## Train with full dataset, using batch size of 4
-```python main.py --training_data=/home/user/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/user/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0-v1 --num_classes=16715 --batch_size=4```
+```python models/pfam-regions/v5-BiRnn.py --training_data=/home/user/datasets/pfam-regions-d0-s20-train.tfrecords --eval_data=/home/user/datasets/pfam-regions-d0-s20-test.tfrecords --model_dir=./checkpoints/d0-v1 --num_classes=16715 --batch_size=4```
