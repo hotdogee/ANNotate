@@ -91,11 +91,11 @@ def load_data(uniprot_file='uniprot.gz',
               num_domain=10,
               test_split=0.2,
               max_seq_per_class_in_train=None,
-              max_seq_per_class_in_eval=None,
+              max_seq_per_class_in_test=None,
               seed=113,
               index_from=1,
               cache_subdir='datasets',
-              cache_dir=None,
+              cache_dir='~',
               **kwargs):
     """Loads the Pfam classification dataset.
 
@@ -232,9 +232,9 @@ def load_data(uniprot_file='uniprot.gz',
     np.random.seed(seed)
     status_text = 'Distributing Sequences to Training and Testing Sets with {:.0%} Split'.format(test_split)
     if max_seq_per_class_in_train:
-        status_text += ' and Max {} Sequences per Domain per Training Set'.format(max_seq_per_class_in_train)
-    if max_seq_per_class_in_eval:
-        status_text += ' and Max {} Sequences per Domain per Evaluation Set'.format(max_seq_per_class_in_eval)
+        status_text += ' and Max {} Sequences per Domain in Training Set'.format(max_seq_per_class_in_train)
+    if max_seq_per_class_in_test:
+        status_text += ' and Max {} Sequences per Domain in Testing Set'.format(max_seq_per_class_in_test)
     print(status_text)
     prog = tf.keras.utils.Progbar(len(domain_seq_dict))
     # assign domains with fewer sequences first
@@ -257,20 +257,20 @@ def load_data(uniprot_file='uniprot.gz',
         seq_list = list(all_seq_set - test_set - train_set)
         # assert counts
         if test_count < 0 or train_count < 0:
-            print('\n WARNING: {}={}, seq_count={}, test_count={}, train_count={}, already in test_set= {}, already in train_set= {}'.format(
+            print('\r WARNING: {}={}, seq_count={}, test_count={}, train_count={}, already in test_set= {}, already in train_set= {}'.format(
                 i, pfamA_acc, seq_count, test_count, train_count, len(test_set & all_seq_set), len(train_set & all_seq_set)
             ))
             test_count = max(0, test_count)
             train_count = max(0, train_count)
         np.random.shuffle(seq_list)
         # limit max_seq_per_class
-        if max_seq_per_class_in_eval:
-            test_count = min(test_count, max_seq_per_class_in_eval)
+        if max_seq_per_class_in_test:
+            test_count = min(test_count, max_seq_per_class_in_test)
             if not max_seq_per_class_in_train:
                 train_count = len(seq_list) - test_count
         if max_seq_per_class_in_train:
             train_count = min(train_count, max_seq_per_class_in_train)
-            if not max_seq_per_class_in_eval:
+            if not max_seq_per_class_in_test:
                 test_count = len(seq_list) - train_count
         # add selected sequences to train and test sets
         test_set |= set(seq_list[len(seq_list)-test_count:])
@@ -389,6 +389,11 @@ def load_data(uniprot_file='uniprot.gz',
         # 50066/50066 [==============================] - 14s 278us/step
         # Generating Domain Sequence Representation for TEST Dataset
         # 49799/49799 [==============================] - 12s 247us/step
+        # 
+        # Generating Domain Sequence Representation for TRAIN Dataset
+        # 43375025/43375025 [==============================] - 3471s 80us/step
+        # Generating Domain Sequence Representation for TEST Dataset
+        # 10848467/10848467 [==============================] - 1125s 104us/step
 
     return dataset, metadata
 
@@ -481,22 +486,25 @@ def save_to_tfrecord(data, path):
     # 50066/50066 [==============================] - 344s 7ms/step
     # Writing D:/datasets2\pfam-regions-d0-s20-p3-test.tfrecords
     # 49799/49799 [==============================] - 319s 6ms/step
+    # 
+    # Writing E:/datasets2\pfam-regions-d0-s20-train.tfrecords
+    # 43375025/43375025 [==============================] - 269932s 6ms/step
+    # Writing E:/datasets2\pfam-regions-d0-s20-test.tfrecords
+    # 10848467/10848467 [==============================] - 65627s 6ms/step
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description='Prepares files on disk for dataset API.')
+        description='Builds the pfam regions tfrecords dataset.')
     parser.add_argument('-n', '--num_classes', type=int, default=None,
         help='Include only the top N domain classes in the dataset file, include all domain classes if None.')
     parser.add_argument('-s', '--test_split', type=float, default=0.2,
-        help='Fraction of the dataset to be used as test data.')
+        help='Fraction of the dataset to be used as test data, default is 0.2.')
     parser.add_argument('-t', '--max_seq_per_class_in_train', type=int, default=None,
-        help='Maximum the number of sequences to include in the training datasets.')
-    parser.add_argument('-e', '--max_seq_per_class_in_eval', type=int, default=None,
-        help='Maximum the number of sequences to include in the testing datasets.')
-    parser.add_argument('-c', '--cache_root', type=str, default=os.path.join(os.path.expanduser('~'), '.keras'),
-        help="Location to store cached files, defaults to '~/.keras'.")
-    parser.add_argument('-d', '--cache_dir', type=str, default='datasets',
-        help="Subdirectory under the cache_root dir where the file is saved.")
+        help='Maximum the number of sequences to include in the training datasets, default is no limit.')
+    parser.add_argument('-e', '--max_seq_per_class_in_test', type=int, default=None,
+        help='Maximum the number of sequences to include in the testing datasets, default is no limit.')
+    parser.add_argument('-d', '--dataset_dir', type=str, default='~/datasets',
+        help="Location to store dataset files, default is ~/datasets.")
 
     args, unparsed = parser.parse_known_args()
     # args.cache_root = 'D:\\'
@@ -505,26 +513,29 @@ if __name__ == "__main__":
     file_prefix = 'pfam-regions-d{}-s{}'.format(args.num_classes or 0, int(args.test_split * 100))
     if args.max_seq_per_class_in_train:
         file_prefix = '{}-t{}'.format(file_prefix, args.max_seq_per_class_in_train)
-    if args.max_seq_per_class_in_eval:
-        file_prefix = '{}-e{}'.format(file_prefix, args.max_seq_per_class_in_eval)
+    if args.max_seq_per_class_in_test:
+        file_prefix = '{}-e{}'.format(file_prefix, args.max_seq_per_class_in_test)
     print('\nPreparing Dataset: {}\n'.format(file_prefix))
+
+    # get absolute path to dataset directory
+    dataset_dir = os.path.abspath(os.path.expanduser(args.dataset_dir))
 
     # print('Loading data...')
     # (x_train, y_train_class, maxlen_train), (x_test, y_test_class, maxlen_test), domain_list = load_data(
     dataset, metadata = load_data(
         num_domain=args.num_classes, test_split=args.test_split, 
         max_seq_per_class_in_train=args.max_seq_per_class_in_train,
-        max_seq_per_class_in_eval=args.max_seq_per_class_in_eval,
-        cache_dir=args.cache_root, cache_subdir=args.cache_dir)
+        max_seq_per_class_in_test=args.max_seq_per_class_in_test,
+        cache_subdir=dataset_dir)
     
-    meta_f = Path(args.cache_root, args.cache_dir, '{}-meta.json'.format(file_prefix))
+    meta_f = Path(dataset_dir, '{}-meta.json'.format(file_prefix))
     print('Writing Metadata: {} ... '.format(meta_f), end="", flush=True)
     meta_f.parent.mkdir(parents=True, exist_ok=True)
     meta_f.write_text(ujson.dumps(metadata, indent=2, sort_keys=False))
     print('DONE')
 
     for k in dataset:
-        save_to_tfrecord(dataset[k], os.path.join(args.cache_root, args.cache_dir,
+        save_to_tfrecord(dataset[k], os.path.join(dataset_dir,
             '{}-{}.tfrecords'.format(file_prefix, k)))
     # train_prefix = '{}-{}'.format(file_prefix, 'train')
     # test_prefix = '{}-{}'.format(file_prefix, 'test')
@@ -577,11 +588,11 @@ if __name__ == "__main__":
     ## MD5: 99764A11E4BC86CD162242E08C968FE9
 
     # Make full dataset
-    # python .\util\make_dataset_pfam_regions.py -c D:/ -d datasets2
-    # MemoryError on Binflux 64GB
+    # python datasets/pfam_regions_build.py -d D:/datasets2
+    # MemoryError on 64GB
     #
     # Make a toy dataset that can finish in 150 steps (60 sec)  - 1 sequence/class
-    # python .\util\make_dataset_pfam_regions.py -t 1 -e 1 -c D:/ -d datasets2
+    # python datasets/pfam_regions_build.py -t 1 -e 1 -d D:/datasets2
     # "train":{
     #     "seq_count":{
     #     "total":16711,
@@ -614,7 +625,9 @@ if __name__ == "__main__":
     #     "max":15143
     #     }
     # },
-    # Make a toy dataset that can finish in 300 steps (120 sec) - 2 sequence/class
-    # python .\util\make_dataset_pfam_regions.py -t 2 -e 2 -c D:/ -d datasets2
-    # Make a toy dataset that can finish in 750 steps (300 sec) - 3 sequence/class
-    # python .\util\make_dataset_pfam_regions.py -t 3 -e 3 -c D:/ -d datasets2
+    # Build a toy dataset that can finish in 750 steps (300 sec) - 3 sequence/class
+    # python datasets/pfam_regions_build.py -t 3 -e 3 -d ~/datasets2
+    # Build a toy dataset that can finish in 300 steps (120 sec) - 2 sequence/class
+    # python datasets/pfam_regions_build.py -t 2 -e 2 -d ~/datasets2
+    # Build a toy dataset that can finish in 40 steps (20 sec)  - 1 sequence/class - 4000 classes
+    # python datasets/pfam_regions_build.py -n 4000 -t 1 -e 1 -d ~/datasets2
