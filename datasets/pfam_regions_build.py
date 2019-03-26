@@ -1,9 +1,11 @@
 
 import os
+import sys
 import time
 import math
 import gzip
-import ujson
+# import ujson
+import json
 import msgpack
 import struct
 import argparse
@@ -57,7 +59,7 @@ def _fa_gz_to_dict(fa_path):
 
 
 def _pfam_regions_tsv_gz_to_dict(tsv_path):
-    """Parse a Pfam-A.regions.uniprot.tsv.gz file into 
+    """Parse a Pfam-A.regions.uniprot.tsv.gz file into
     domain_regions_dict[pfamA_acc] = [(uniprot_acc + '.' + seq_version, seq_start, seq_end), ...]
     """
     print('Parsing {}'.format(os.path.basename(tsv_path)))
@@ -162,6 +164,7 @@ def load_data(uniprot_file='uniprot.gz',
         print('CACHE: {0}'.format(seq_dict_cache_path), end="", flush=True)
         start = time.perf_counter()
         with open(seq_dict_cache_path, 'rb') as f:
+            # seq_dict = msgpack.load(f, raw=False, max_buffer_size=sys.maxsize)
             seq_dict = msgpack.load(f, raw=False)
         print(' - {:.0f}s'.format(time.perf_counter() - start))
         # Loading Protein Sequence Data from CACHE: D:/datasets2\uniprot.msgpack - 84s
@@ -177,7 +180,7 @@ def load_data(uniprot_file='uniprot.gz',
     print('Loaded {:,} Sequences, Amino Acids Min {:,}, Median {:,}, Max {:,}, Total {:,}'.format(
         len(seq_lengths), seq_lengths[0], seq_lengths[len(seq_lengths)//2], seq_lengths[-1], sum(seq_lengths)))
     # Loaded 71,201,428 Sequences, (2, 267, 36,805, 23,867,549,122) = (min, median, max, total)
-    
+
     print('Loading Domain Region Data from ', end="", flush=True)
     # domain_regions_dict[pfamA_acc] = [(uniprot_acc + '.' + seq_version, seq_start, seq_end), ...]
     domain_regions_dict_cache_path = '{0}.msgpack'.format(os.path.splitext(regions_path)[0])
@@ -195,7 +198,7 @@ def load_data(uniprot_file='uniprot.gz',
         with open(domain_regions_dict_cache_path, 'wb') as f:
             msgpack.dump(domain_regions_dict, f)
             # Pfam-A.regions.uniprot.tsv.msgpack 1.32 GB (1,420,160,623 位元組)
-    
+
     # domain_regions_dict stats
     domain_lengths = sorted([len(s) for s in domain_regions_dict.values()])
     print('Loaded {:,} Domains, Regions Min {:,}, Median {:,}, Max {:,}, Total {:,}'.format(
@@ -357,6 +360,9 @@ def load_data(uniprot_file='uniprot.gz',
     # domains = []
     for k in dataset:
         print('Generating Domain Sequence Representation for {} Dataset'.format(k.upper()))
+        if len(dataset[k]['seq_ids']) == 0:
+            print('No sequences to process for {} Dataset'.format(k.upper()))
+            continue
         prog = tf.keras.utils.Progbar(len(dataset[k]['seq_ids']))
         domain_seq_count = defaultdict(set)
         seq_len = []
@@ -389,7 +395,7 @@ def load_data(uniprot_file='uniprot.gz',
         # 50066/50066 [==============================] - 14s 278us/step
         # Generating Domain Sequence Representation for TEST Dataset
         # 49799/49799 [==============================] - 12s 247us/step
-        # 
+        #
         # Generating Domain Sequence Representation for TRAIN Dataset
         # 43375025/43375025 [==============================] - 3471s 80us/step
         # Generating Domain Sequence Representation for TEST Dataset
@@ -447,6 +453,9 @@ def load_data(uniprot_file='uniprot.gz',
 def save_to_tfrecord(data, path):
     """Saves data to tfrecord file.
     """
+    if len(data['seq_ids']) == 0:
+        print('No sequences to save.')
+        return
     print('Writing {}'.format(path))
     with tf.python_io.TFRecordWriter(path) as writer:
         prog = tf.keras.utils.Progbar(len(data['seq_ids']))
@@ -476,7 +485,7 @@ def save_to_tfrecord(data, path):
     # 16711/16711 [==============================] - 105s 6ms/step
     # Writing D:/datasets2\pfam-regions-d0-s20-p1-test.tfrecords
     # 16711/16711 [==============================] - 105s 6ms/step
-    # 
+    #
     # Writing D:/datasets2\pfam-regions-d0-s20-p2-train.tfrecords
     # 33399/33399 [==============================] - 186s 6ms/step
     # Writing D:/datasets2\pfam-regions-d0-s20-p2-test.tfrecords
@@ -486,7 +495,7 @@ def save_to_tfrecord(data, path):
     # 50066/50066 [==============================] - 344s 7ms/step
     # Writing D:/datasets2\pfam-regions-d0-s20-p3-test.tfrecords
     # 49799/49799 [==============================] - 319s 6ms/step
-    # 
+    #
     # Writing E:/datasets2\pfam-regions-d0-s20-train.tfrecords
     # 43375025/43375025 [==============================] - 269932s 6ms/step
     # Writing E:/datasets2\pfam-regions-d0-s20-test.tfrecords
@@ -509,7 +518,7 @@ if __name__ == "__main__":
     args, unparsed = parser.parse_known_args()
     # args.cache_root = 'D:\\'
     # print(args)
-    
+
     file_prefix = 'pfam-regions-d{}-s{}'.format(args.num_classes or 0, int(args.test_split * 100))
     if args.max_seq_per_class_in_train:
         file_prefix = '{}-t{}'.format(file_prefix, args.max_seq_per_class_in_train)
@@ -523,18 +532,21 @@ if __name__ == "__main__":
     # print('Loading data...')
     # (x_train, y_train_class, maxlen_train), (x_test, y_test_class, maxlen_test), domain_list = load_data(
     dataset, metadata = load_data(
-        num_domain=args.num_classes, test_split=args.test_split, 
+        num_domain=args.num_classes, test_split=args.test_split,
         max_seq_per_class_in_train=args.max_seq_per_class_in_train,
         max_seq_per_class_in_test=args.max_seq_per_class_in_test,
         cache_subdir=dataset_dir)
-    
+
     meta_f = Path(dataset_dir, '{}-meta.json'.format(file_prefix))
     print('Writing Metadata: {} ... '.format(meta_f), end="", flush=True)
-    meta_f.parent.mkdir(parents=True, exist_ok=True)
-    meta_f.write_text(ujson.dumps(metadata, indent=2, sort_keys=False))
+    meta_f.parent.mkdir(parents=True, exist_ok=True) # pylint: disable=no-member
+    meta_f.write_text(json.dumps(metadata, indent=2, sort_keys=False))
     print('DONE')
 
     for k in dataset:
+        if len(dataset[k]['seq_ids']) == 0:
+            print('No sequences to save for {} Dataset'.format(k.upper()))
+            continue
         save_to_tfrecord(dataset[k], os.path.join(dataset_dir,
             '{}-{}.tfrecords'.format(file_prefix, k)))
     # train_prefix = '{}-{}'.format(file_prefix, 'train')
@@ -565,13 +577,13 @@ if __name__ == "__main__":
     # }, indent=2, sort_keys=False))
 
     # # convert to tfrecords
-    # train_path = os.path.join(args.cache_root, args.cache_dir, 
+    # train_path = os.path.join(args.cache_root, args.cache_dir,
     #     'pfam-regions-d{}-s{}-{}.tfrecords'.format(args.num_classes or 0, int(args.test_split * 100), 'train'))
     # save_to_tfrecord(x_train, y_train_class, train_path)
-    # test_path = os.path.join(args.cache_root, args.cache_dir, 
+    # test_path = os.path.join(args.cache_root, args.cache_dir,
     #     'pfam-regions-d{}-s{}-{}.tfrecords'.format(args.num_classes or 0, int(args.test_split * 100), 'test'))
     # save_to_tfrecord(x_test, y_test_class, test_path)
-    
+
     # d0
     # 43,378,794 train sequences (??? bases)
     # 10,844,699 test sequences
@@ -589,6 +601,7 @@ if __name__ == "__main__":
 
     # Make full dataset
     # python datasets/pfam_regions_build.py -d D:/datasets2
+    # Memory needed: Windows 100GB, Fedora 128GB
     # MemoryError on 64GB
     #
     # Make a toy dataset that can finish in 150 steps (60 sec)  - 1 sequence/class
